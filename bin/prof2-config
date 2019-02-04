@@ -1,0 +1,19 @@
+#!/bin/bash
+
+fpath=`readlink -f ${BASH_SOURCE[0]}`
+
+profdir=`dirname ${fpath}`/../
+
+if [ "${1}" == "--includedir" ]
+then
+    echo ${profdir}include
+elif [ "${1}" == "--libdir" ]
+then
+    echo ${profdir}lib
+elif [ "${1}" == "--prefix" ]
+then
+    echo ${profdir}
+else
+    echo "Usage: ${0} --libdir [ --includedir, --prefix ]"
+fi
+

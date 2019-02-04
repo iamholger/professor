@@ -1,0 +1,462 @@
+#!/usr/bin/env python
+
+"""\
+%prog [<ipolfile>=ipol.dat [<refdir>]]
+
+Interactive parameterisation explorer with optional ref data display
+
+TODO:
+ * Need to allow no-ref visualisation
+ * Optionally display the envelope of input MC runs
+"""
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="Turn off messages")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict plotting to a subset of histograms (default: %default)")
+# TODO: Add weight file parsing to decide which histos (and bin subsets) to interpolate
+opts, args = op.parse_args()
+
+## Get arguments
+IFILE = "ipol.dat"
+if len(args) >= 1:
+    IFILE = args[0]
+REFDIR = None
+if len(args) >= 2:
+    REFDIR = args[1]
+
+
+## Load the Professor machinery
+import professor2 as prof
+from professor2 import misc
+
+if not opts.QUIET:
+    print prof.logo
+
+
+## Read in ipol histos
+IHISTOS, METADATA = prof.read_ipoldata(IFILE)
+
+## Weight file parsing
+if opts.WFILE:
+    matchers = prof.read_pointmatchers(opts.WFILE)
+    for hn in IHISTOS.keys():
+        if not any(m.match_path(hn) for m in matchers.keys()):
+            del IHISTOS[hn]
+    if len(IHISTOS.keys())==0:
+        print "Nothing left after weight file parsing, exiting"
+        sys.exit(0)
+
+## List of rivet analysis paths in IHISTOS
+# TODO: Urgh, avoid this sort of noise-code!
+ananames = list(set([filter(lambda x:len(x)>1, i.split("/"))[0] for i in IHISTOS.keys()]))
+
+## Read reference data histos
+import glob
+HISTOS = {}
+# TODO: consistent directory convention and protect against invalid structures
+if REFDIR is not None:
+    reffiles = glob.glob(os.path.join(REFDIR, "*"))
+    for rf in reffiles:
+        HISTOS.update(prof.read_histos(rf))
+
+    ## Find things available in both
+    available = []
+    for i in IHISTOS.keys():
+        if i in HISTOS.keys():
+            available.append([i,i])
+    ibins = []
+    databins = []
+    for a in available:
+        ibins.extend(  IHISTOS[a[0]].bins)
+        databins.extend(HISTOS[a[1]].bins)
+
+else:
+    ibins = []
+    available = [(i,i) for i in IHISTOS.keys()]
+    for a in available:
+        ibins.extend(  IHISTOS[a[0]].bins)
+
+## Sanity checks
+
+if not ibins:
+    print "No bins ..., exiting"
+    import sys
+    sys.exit(1)
+
+
+## Import and set up matplotlib (AFTER parsing arguments)
+try:
+    import matplotlib
+    matplotlib.use('WXAgg')
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_wxagg import FigureCanvasWxAgg as FigCanvas
+    from matplotlib.backends.backend_wxagg import NavigationToolbar2WxAgg as NavigationToolbar
+    import wx, functools
+    params = {
+        'backend': 'pdf',
+        'axes.labelsize' : 16,
+        'text.size' : 16,
+        'legend.fontsize' : 16,
+        'axes.titlesize' : 16,
+        'xtick.labelsize' : 16,
+        'ytick.labelsize' : 16,
+        'text.usetex' : False,
+        'figure.dpi' : 50,
+        'lines.markersize' : 10,
+        'lines.linewidth' : 2,
+        'lines.elinewidth' : 3,
+        'lines.antialiased' : False,
+        #'patches.antialiased' : False,
+        'figure.subplot.left' : 0.05,
+        'figure.subplot.right' : 0.995,
+        'figure.subplot.bottom' : 0.1,
+        'figure.subplot.top' : 0.95,
+        'figure.subplot.wspace' : 0.15
+        }
+    for k, v in params.iteritems():
+        try:
+            matplotlib.rcParams[k] = v
+        except:
+            pass
+except Exception, e:
+    print "Problem with getting & configuring matplotlib/WX interface method: %s" % e
+    print "Exiting!"
+    sys.exit(1)
+
+observables=sorted([a[0] for a in available]) # When interested in comparison with data
+#observables=sorted(IHISTOS.keys())            # all ipols, not neccessary data available
+
+
+# TODO: add error bar plotting option (with errs from ipol)
+
+
+def mk_line(obs, ppoint, derivative=False):
+    """
+    Prepare points for matplotlib step
+    """
+    X, Y = [], []
+    for b in IHISTOS[obs].bins:
+        X.append(b.xmin)
+        X.append(b.xmax)
+        if derivative:
+            y = b.der(ppoint)
+        else:
+            y = b.val(ppoint)
+        Y.append(y)
+        Y.append(y)
+    return X, Y
+
+def mk_data(obs, prefix=""):
+    X, Y, dY = [], [], []
+    try:
+        for b in HISTOS[prefix+obs].bins:
+            X.append(b.xmid)
+            Y.append(b.val)
+            dY.append(b.err)
+    except Exception, e:
+        if opts.DEBUG:
+            print "No data available for %s"%obs
+    return X, Y, dY
+
+def mk_pull(obs, ppoint, prefix="/REF"):
+    """
+    Prepare points for matplotlib step
+    """
+    X, Y = [], []
+    for num, b in enumerate(IHISTOS[obs].bins):
+        X.append(b.xmin)
+        X.append(b.xmax)
+        p=prof.misc.pull(HISTOS[prefix+obs].bins[num], b, ppoint)
+        Y.append(p)
+        Y.append(p)
+    return X, Y
+
+
+class ParamFrame(wx.Frame):
+    """
+    Simple frame with param sliders that update the main frame's plots.
+    """
+    def __init__(self, parent):
+        no_sys_menu = wx.CAPTION
+        wx.Frame.__init__(self, None,  title='Prof-I: Parameter control')#, style=no_sys_menu)
+        self.params = METADATA["ParamNames"].split()
+        self.panel = wx.Panel(self)
+        self.parent = parent
+        self.sliders = {}
+
+        ## Parameter sliders and buttons
+        controlgrid = wx.GridBagSizer(hgap=5, vgap=2)
+
+        font = wx.Font(10, wx.MODERN, wx.NORMAL, wx.BOLD)
+        ## Build the sliders and related objects
+        for i, param in enumerate(self.params):
+            ### Add param names
+            t=wx.StaticText(self.panel, -1, param)
+            t.SetFont(font)
+            controlgrid.Add(t, pos=(i,0))
+            ## Sliders
+            #http://www.wxpython.org/docs/api/wx.lib.agw.floatspin-module.html
+            from wx.lib.agw.floatspin import FloatSpin, EVT_FLOATSPIN
+            pmin = float(METADATA["MinParamVals"].split()[i])
+            pmax = float(METADATA["MaxParamVals"].split()[i])
+
+            from wx.lib.agw.floatspin import FloatSpin, EVT_FLOATSPIN
+            slider = FloatSpin(self.panel, -1, style=0, value=pmin + 0.5*(pmax-pmin),
+                               min_val=pmin, max_val=pmax, increment=abs(pmax-pmin)/50., size=(400,40))
+            controlgrid.Add(slider, pos=(i,2))
+            self.sliders[param] = slider
+        self.Bind(EVT_FLOATSPIN, self.parent.sliderUpdate)
+        self.panel.SetSizer(controlgrid)
+        controlgrid.Fit(self)
+
+
+class ProfIFrame(wx.Frame):
+
+    def __init__(self):
+        title = 'prof-I: Professor Interactive'
+        wx.Frame.__init__(self, None, -1, title)
+        # The Frame with the parameter thingies
+        self.child = ParamFrame(self)
+        self.child.Show()
+        # This frame
+        self.histos = {}
+        self.refhistos = {"left" : None, "right" : None}
+        self.logy = {"left" : False, "right" : False}
+        self.pull = {"left" : False, "right" : False}
+        self.derivative = {"left" : False, "right" : False}
+        self.limits = {}
+        self.drawobs = { "left"  : sorted(observables)[0],
+                         "right" : sorted(observables)[1 if len(observables) > 1 else 0] }
+        self.createMainPanel()
+        self.updateObs(None, "left")
+        self.updateObs(None, "right")
+
+
+    def createMainPanel(self):
+        """ Creates the main panel with all the controls on it:
+             * mpl canvas
+             * mpl navigation toolbar
+             * Control panel for interaction
+        """
+        self.dpi=50
+        self.panel = wx.Panel(self)
+
+        ## Panel for observable diplay
+        self.fig = Figure((10.0, 4.0), dpi=self.dpi, facecolor="white")
+        self.canvas = FigCanvas(self.panel, -1, self.fig)
+        self.axes  = self.fig.add_subplot(121)
+        self.axes2 = self.fig.add_subplot(122)
+
+        ## Layout with box sizers
+        ## matplotlib canvas and matplotlib toolbar
+        self.vbox = wx.BoxSizer(wx.VERTICAL)
+        self.vbox.Add(self.canvas, 1, wx.LEFT | wx.TOP | wx.GROW | wx.EXPAND)
+
+        ## Choice of observable 1
+        self.hbox = wx.GridBagSizer(hgap=5, vgap=2)
+        self.hbox.Add(wx.StaticText(self.panel, -1, "Obs 1:"), pos=(0,0))
+        self.obschoice1 = wx.Choice(self.panel, -1, (85, 18), choices=sorted(observables))
+        self.obschoice1.SetSelection(sorted(observables).index(self.drawobs["left"]))
+        self.hbox.Add(self.obschoice1, pos=(0,1))
+        self.logy1chkbx = wx.CheckBox(self.panel, -1, "logy")
+        self.hbox.Add(self.logy1chkbx, pos=(0,2))
+        self.Bind(wx.EVT_CHOICE, functools.partial(self.updateObs, which="left"), self.obschoice1)
+        self.Bind(wx.EVT_CHECKBOX, self.setLogy, self.logy1chkbx)
+        self.pull1chkbx = wx.CheckBox(self.panel, -1, "pull")
+        self.hbox.Add(self.pull1chkbx, pos=(0,3))
+        self.der1chkbx = wx.CheckBox(self.panel, -1, "derivative")
+        self.hbox.Add(self.der1chkbx, pos=(0,4))
+        self.Bind(wx.EVT_CHOICE, functools.partial(self.updateObs, which="left"), self.obschoice1)
+        self.Bind(wx.EVT_CHECKBOX, self.setPull, self.pull1chkbx)
+        self.Bind(wx.EVT_CHECKBOX, self.setDerivative, self.der1chkbx)
+
+        ## Choice of observable 2
+        self.hbox.Add(wx.StaticText(self.panel, -1, "Obs 2:"), pos=(0,5))
+        self.obschoice2 = wx.Choice(self.panel, -1, (85, 18), choices=sorted(observables))
+        self.obschoice2.SetSelection(sorted(observables).index(self.drawobs["right"]))
+        self.hbox.Add(self.obschoice2, pos=(0,6))
+        self.logy2chkbx = wx.CheckBox(self.panel, -1, "logy")
+        self.hbox.Add(self.logy2chkbx, pos=(0,7))
+        self.Bind(wx.EVT_CHOICE, functools.partial(self.updateObs, which="right"), self.obschoice2)
+        self.Bind(wx.EVT_CHECKBOX, self.setLogy, self.logy2chkbx)
+        self.pull2chkbx = wx.CheckBox(self.panel, -1, "pull")
+        self.hbox.Add(self.pull2chkbx, pos=(0,8))
+        self.der2chkbx = wx.CheckBox(self.panel, -1, "derivative")
+        self.hbox.Add(self.der2chkbx, pos=(0,9))
+        self.Bind(wx.EVT_CHOICE, functools.partial(self.updateObs, which="right"), self.obschoice2)
+        self.Bind(wx.EVT_CHECKBOX, self.setPull, self.pull2chkbx)
+        self.Bind(wx.EVT_CHECKBOX, self.setDerivative, self.der2chkbx)
+        self.hbox.Fit(self)
+
+        self.vbox.Add(self.hbox)
+        self.vbox.AddSpacer((10,10))
+
+        self.hbox1 = wx.BoxSizer(wx.HORIZONTAL)
+
+        ## vbox for x/y limits
+        self.limitgrid = wx.GridBagSizer(hgap=5, vgap=2)
+        # Buttons to reset
+        self.limitgrid.Add(wx.StaticText(self.panel, -1, "Limits 1:"), pos=(0,0))
+        self.resetBtn = wx.Button(self.panel, label="Reset")
+        self.Bind(wx.EVT_BUTTON, functools.partial(self.resetLimits, which="left"), self.resetBtn)
+        self.limitgrid.Add(self.resetBtn, pos=(0,1))
+        self.resetBtn2 = wx.Button(self.panel, label="Reset")
+        self.Bind(wx.EVT_BUTTON, functools.partial(self.resetLimits, which="right"), self.resetBtn2)
+        self.limitgrid.Add(self.resetBtn2, pos=(0,4))
+        # Input fields
+        limittypes = ("XMin", "XMax", "YMin", "YMax")
+        self.limits["left"] = {}
+        for num, i in enumerate(limittypes):
+            self.limitgrid.Add(wx.StaticText(self.panel, -1, i), pos=(num+1, 0))
+            textctrl = wx.TextCtrl(self.panel, -1, "None")
+            self.limitgrid.Add(textctrl, pos=(num+1,1))
+            self.limits["left"][i] = textctrl
+        self.limitgrid.Add(wx.StaticText(self.panel, -1, "Limits 2:"), pos=(0,3))
+        self.limits["right"] = {}
+        for num, i in enumerate(limittypes):
+            self.limitgrid.Add(wx.StaticText(self.panel, -1, i), pos=(num+1, 3))
+            textctrl = wx.TextCtrl(self.panel, -1, "None", style=wx.TE_PROCESS_ENTER)
+            self.limitgrid.Add(textctrl, pos=(num+1,4))
+            self.limits["right"][i] = textctrl
+        self.hbox1.Add(self.limitgrid)
+        # Bind text fields to sliderUpdate
+        for textctrl in self.limits["left"].values():
+            self.Bind(wx.EVT_TEXT,
+                    self.sliderUpdate, textctrl)
+        for textctrl in self.limits["right"].values():
+            self.Bind(wx.EVT_TEXT,
+                    self.sliderUpdate, textctrl)
+
+
+        ## Add  to the main vertical box
+        self.vbox.Add(self.hbox1)
+
+        self.panel.SetSizer(self.vbox)
+        self.vbox.Fit(self)
+
+        ## Maximize the window
+        self.Maximize()
+
+
+    def setLogy(self, event):
+        """ See if the checkboxes are checked and set logy-scales accordingly """
+        for i in [(self.logy1chkbx, "left", self.axes), (self.logy2chkbx, "right", self.axes2)]:
+            if i[0].IsChecked():
+                #self.logy[i[1]]=True
+                i[2].set_yscale('log')
+            else:
+                #self.logy[i[1]]=False
+                i[2].set_yscale('linear')
+        self.sliderUpdate(None)
+
+    def setPull(self, event):
+        """ See if the checkboxes are checked and switch to pull mode """
+        for i in [(self.pull1chkbx, "left", self.axes), (self.pull2chkbx, "right", self.axes2)]:
+            if i[0].IsChecked():
+                self.pull[i[1]]=True
+            else:
+                self.pull[i[1]]=False
+        self.sliderUpdate(None)
+
+    def setDerivative(self, event):
+        """ See if the checkboxes are checked and switch to pull mode """
+        for i in [(self.der1chkbx, "left", self.axes), (self.der2chkbx, "right", self.axes2)]:
+            if i[0].IsChecked():
+                self.derivative[i[1]]=True
+            else:
+                self.derivative[i[1]]=False
+        self.sliderUpdate(None)
+
+    def sliderUpdate(self, event, redraw=True):
+        ppoint = self.getCurrentParamValues()
+        self.plotHistos(ppoint, redraw=redraw)
+        ## Set plot limits
+        self.setLimits(self.axes, self.getLimits(self.limits["left"]))
+        self.setLimits(self.axes2, self.getLimits(self.limits["right"]))
+        self.canvas.draw()
+
+    def getCurrentParamValues(self):
+        return [self.child.sliders[k].GetValue() for k in self.child.params]
+
+    def resetLimits(self, event, which):
+        for i in "XMin XMax YMin YMax".split():
+            self.limits[which][i].SetValue("None")
+        self.updateObs(None, which)
+
+    def getLimits(self, limdict):
+        xmin = self.convertInput(limdict["XMin"].GetValue())
+        xmax = self.convertInput(limdict["XMax"].GetValue())
+        ymin = self.convertInput(limdict["YMin"].GetValue())
+        ymax = self.convertInput(limdict["YMax"].GetValue())
+        return xmin, xmax, ymin, ymax
+
+    def setLimits(self, sub, thelimits):
+        xmin, xmax, ymin, ymax = thelimits
+        sub.set_xlim(xmin, xmax)
+        sub.set_ylim(ymin, ymax)
+
+
+    def convertInput(self, inp):
+        try:
+            return float(inp)
+        except:
+            return None
+
+    def updateObs(self, event=None, which=None):
+        """Update the observable assigned the L or R window.
+        """
+        self.axes.clear()
+        self.axes2.clear()
+        if which in ("left", None):
+            self.drawobs["left"] = observables[self.obschoice1.GetSelection()]
+        if which in ("right", None):
+            self.drawobs["right"] = observables[self.obschoice2.GetSelection()]
+
+        ## Set titles and axis labels, using the rivet plot file parser if possible
+        obs1 = self.drawobs["left"]
+        obs2 = self.drawobs["right"]
+        self.axes.set_title(obs1)
+        self.axes2.set_title(obs2)
+
+        if not self.pull['left']:
+            self.plotDataHisto(self.axes, 'left')
+        if not self.pull['right']:
+            self.plotDataHisto(self.axes2, 'right')
+        #
+        self.sliderUpdate(None, redraw=False)
+
+    def plotDataHisto(self, sub, which):
+        x,y,ye = mk_data(self.drawobs[which])
+        if len(x)>0:
+            self.refhistos[which] = sub.errorbar(x,y, yerr=ye, ls=" ", marker="o", color="k", label="Data")
+
+
+    def plotHistos(self, ppoint, redraw=False):
+        """ This plots the observable prediction calculated from the
+            parameterisation.
+        """
+        for i in (['left', self.axes, self.drawobs["left"]],
+                  ['right',self.axes2, self.drawobs["right"]]):
+
+            # Get the coordinates for the ipol histos step draw
+            if self.pull[i[0]]:
+                X, Y = mk_pull(i[2], ppoint)#, self.logy[i[0]])
+            else:
+                X, Y = mk_line(i[2], ppoint, self.derivative[i[0]])#, self.logy[i[0]])
+            if redraw is False:
+                self.histos[i[0]] = i[1].step(X, Y, color="r", where="post")
+            else:
+                self.histos[i[0]][0].set_xdata(X)
+                self.histos[i[0]][0].set_ydata(Y)
+                ## Workaround for changes in matplotlib 0.99
+                try:
+                    i[1].redraw_in_frame()
+                except:
+                    pass
+
+## Run GUI application
+app = wx.App()
+ProfIFrame().Show()
+app.MainLoop()

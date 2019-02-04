@@ -1,0 +1,83 @@
+#! /usr/bin/env python
+
+"""\
+%prog <param1,param2,param3> [<ipolfile>=ipol.dat]
+
+%prog PARAMFILE [<ipolfile>=ipol.dat]
+
+Write out interpolated histograms at a given parameter point.
+
+"""
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-o", "--output", dest="OUTPUT", default="pred.yoda", help="Output file name (default: %default)")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict output to a subset of histograms (default: %default)")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="Turn off messages")
+opts, args = op.parse_args()
+
+
+try:
+    import yoda
+except ImportError:
+    "YODA not found, exiting"
+    import sys
+    sys.exit(1)
+
+
+
+## Get mandatory arguments
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+PARAMSTR = args[0]
+IFILE = "ipol.dat"
+if len(args) >= 2:
+    IFILE = args[1]
+
+
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+## Parse the param point argument
+PARAMS = None
+if os.path.exists(PARAMSTR):
+    with open(args[0]) as f:
+        VALS  = [float(l.strip().split()[-1]) for l in f if not l.startswith("#")]
+    with open(args[0]) as f:
+        NAMES = [l.strip().split()[0] for l in f if not l.startswith("#")]
+else:
+    print "No parameter file given or specified param file does not exist, exiting..."
+    sys.exit(1)
+
+
+PARAMS=dict(zip(NAMES, VALS))
+
+## Read ipol param names and histos
+IHISTOS, META = prof.read_ipoldata(IFILE)
+PNAMES = META["ParamNames"].split()
+
+# Reorder parampoint values according to order of params in ipol file
+TESTPOINT = [PARAMS[k] for k in PNAMES]
+
+## Weight file parsing
+if opts.WFILE:
+    matchers = prof.read_pointmatchers(opts.WFILE)
+    for hn in IHISTOS.keys():
+        if not any(m.match_path(hn) for m in matchers.keys()):
+            del IHISTOS[hn]
+    if len(IHISTOS.keys())==0:
+        print "Nothing left after weight file parsing, exiting"
+        sys.exit(0)
+
+
+## Write out ipolhistos
+ofile = opts.OUTPUT
+scatters=[IHISTOS[k].toDataHisto(TESTPOINT).toScatter2D() for k in sorted(IHISTOS.keys())]
+yoda.writeYODA(scatters, ofile)
+
+if not opts.QUIET:
+    print "Wrote output to", ofile

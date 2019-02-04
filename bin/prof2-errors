@@ -1,0 +1,475 @@
+#! /usr/bin/env python
+
+"""\
+%prog <burstdir> <refdir> [ipolfile=ipol.dat] [opts]
+
+Interpolate histo bin values as a function of the parameter space by loading
+run data and parameter lists from run directories in $runsdir (often "mc")
+
+TODO:
+ * Use weight file position matches to exclude some bins, as well as path matching
+ * Handle run combination file/string (write a hash of the run list into the ipol filename?)
+ * Support asymm error parameterisation
+"""
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("--ierr",  dest="IERR", default="symm", help="Whether to interpolate MC errors: none, mean, median, symm (default: %default)") #< add rel, asymm
+op.add_option("-n", dest="NSAMPLES", type=int,  default=1, help="Number of samples")
+op.add_option("-j", dest="MULTI", type=int, default=1, help="Number of threads to use")
+op.add_option("--minos", dest="MINOS", default=False, action="store_true", help="Run Minos algorithm after minimisation")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict ipol building to a subset of bins (default: %default)")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("-g", "--gradient", dest="GRADIENT", action="store_true", default=False, help="Run minimisation with analytic gradient (EXPERIMENTAL!)")
+op.add_option("-s", "--strategy", dest="STRATEGY",  default=1, type=int, help="Set Minuit strategy [0 fast, 1 default, 2 slow]")
+op.add_option("-r", "--result", dest="RESULT",  default=None, help="Minimisation result to use for eigentunes calculation")
+op.add_option("--filter", dest="FILTER", action="store_true", default=False, help="Filter out data bins that have 0 error")
+op.add_option("--cl", "--perc", dest="PERCENTILE", type=float, default=95, help="Percentile for eigentunes")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+op.add_option("-o", "--outfile", dest="OUTFILE", default="gofs.txt", help="Output file name for the gof measures")
+op.add_option("-p", "--prefix", dest="PREFIX", default="BURST", help="Output file name prefix")
+op.add_option("-O", "--outdir", dest="OUTDIR", default=None, help="Output directory")
+op.add_option("-S", "--subrun", dest="SUBRUN", default=0, type=int, help="Subrun in case of distributed computing")
+opts, args = op.parse_args()
+
+## Get mandatory arguments
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+INDIR = args[0]
+REFDIR = args[1]
+IFILE = args[2] if len(args) > 2 else "ipol.dat"
+
+
+## Load the Professor machinery
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+
+IHISTOS, IMETA = prof.read_ipoldata(IFILE)
+# PARAMS = prof.read_params(RUNSDIR)
+# # Throw away those points not used in the original ipol
+# USEDRUNS = IMETA["Runs"].split()
+# from collections import OrderedDict
+# USEDPARAMS = OrderedDict()
+# for k, v in PARAMS.iteritems():
+    # if k in USEDRUNS:
+        # USEDPARAMS[k]=v
+
+## Weight file parsing to select a histos subset
+if opts.WFILE:
+    matchers = prof.read_pointmatchers(opts.WFILE)
+    for hn in IHISTOS.keys():
+        if not any(m.match_path(hn) for m in matchers.keys()):
+            del IHISTOS[hn]
+        elif opts.DEBUG:
+            print "Observable %s passed weight file path filter" % hn
+    print "Filtered observables by path, %d remaining" % len(IHISTOS)
+
+DHISTOS_raw = prof.read_all_histos(REFDIR)
+DHISTOS = {}
+
+# Throw away all data histos not needed
+for k in IHISTOS.keys():
+    DHISTOS[k] = DHISTOS_raw[k]
+del DHISTOS_raw
+
+matchers = prof.read_pointmatchers(opts.WFILE) if opts.WFILE else None
+
+
+
+def mkGoFPlot(X, dof, OUTDIR, GOF_min=None):
+    import numpy as np
+    g_68 = np.percentile(X, 68.8)
+    g_95 = np.percentile(X, 95)
+    g_99 = np.percentile(X, 99.9)
+
+    import pylab as pl
+    pl.axvspan(min(X),g_68, label="68.8 pct", facecolor='b', alpha=0.1)
+    pl.axvspan(g_68, g_95, label="95 pct", facecolor='r', alpha=0.1)
+    pl.axvspan(g_95, g_99, label="99.9 pct", facecolor='g', alpha=0.1)
+    pl.hist(X, "auto", normed=True, histtype="step")
+    # from scipy.stats import chi2
+    # x = np.linspace(chi2.ppf(0.01, dof), chi2.ppf(0.99, dof), 100)
+    # pl.plot(x, chi2.pdf(x, dof), 'r-', lw=5, alpha=0.6, label='chi2 pdf dof=%i'%dof)
+    if GOF_min is not None:
+        pl.axvline(GOF_min, ls="--", lw=3, label="Observed")
+
+    pl.legend()
+    pl.xlabel(r"$\chi^2$")
+    pl.ylabel(r"$p(X = \chi^2)$")
+    pl.tight_layout()
+    pl.savefig("%s/myprofgof.pdf" % OUTDIR)
+
+    pl.clf()
+    pl.hist(X, "auto", normed=True, cumulative=True, histtype="step")
+    pl.axhspan(0, 0.688, label="68.8 pct", facecolor='b', alpha=0.1)
+    pl.axhspan(0.688, 0.95, label="95 pct", facecolor='r', alpha=0.1)
+    pl.axhspan(0.95, 0.999, label="99.9 pct", facecolor='g', alpha=0.1)
+    pl.legend(loc="upper left")
+    pl.xlabel(r"$\chi^2$")
+    pl.ylabel(r"$P(X < \chi^2)$")
+    pl.tight_layout()
+    pl.savefig("%s/myprofgofcumulative.pdf" % OUTDIR)
+
+
+def mkResDistPlot(X, pname, OUTDIR):
+    import pylab as pl
+    pl.clf()
+    pl.hist(X, "auto", normed=True, histtype="step")
+    pl.xlabel(pname)
+    pl.tight_layout()
+    pl.savefig("%s/distr_%s.pdf" % (OUTDIR, pname))
+
+
+
+def mySolve(center_t, direction_t, TRAFO, GOFdef, target):
+    exec GOFdef in globals() # Note globals!
+
+    def getVal(a):
+        temp_t = center_t +  a*direction_t
+        temp = TRAFO * temp_t.transpose()
+        temp_r = temp.transpose().tolist()[0]
+        return profGoF(*temp_r) - target
+
+    def getP(a):
+        temp_t = center_t +  a*direction_t
+        temp = TRAFO * temp_t.transpose()
+        return temp.transpose().tolist()[0]
+
+    from scipy.optimize import fsolve
+    x = fsolve(getVal,1)
+    return getP(x)
+
+
+def mkNewParamCorrelation(T_trans, T, point, GOFdef, target):# center_t, TRAFO, GOFdef, target, oldCOV, TRAFO_trans):
+    exec GOFdef in globals() # Note globals!
+
+    from numpy import matrix
+    rv = matrix(point.values())
+    center_t = (T_trans * rv.transpose()).transpose()
+
+    DIM = len(point.values())
+    from scipy.optimize import fsolve
+    from numpy import zeros,diag
+
+    def getVal(a, direction):
+        temp_t = center_t +  a*direction
+        temp = T * temp_t.transpose()
+        temp_r = temp.transpose().tolist()[0]
+        return profGoF(*temp_r) - target
+
+    def getX(a, direction):
+        return center_t +  a*direction
+
+    newdiag = []
+    for i in xrange(DIM):
+        ev = zeros(DIM)
+        ev[i] = 1
+        temp  = fsolve(lambda x:getVal(x, ev), 1)
+        temp2 = fsolve(lambda x:getVal(x, -ev), 1)
+        if temp > temp2:
+            newdiag.append(temp)
+        else:
+            newdiag.append(temp2)
+
+    N = diag([x[0] for x in newdiag])
+    return T_trans*N*T
+
+
+def mkEigentunes(T_trans, T, point, GOFdef, target, plus=True):
+    """
+    COV   ... real symmetric covariance matrix
+    point ... could be any point in the true parameter space but should be
+              the minimisation result i.e. the center of COV
+    """
+    from numpy import sqrt, zeros, matrix
+    # Trsnform the minimisation result into the other coordinate system
+    rv = matrix(point.values()).transpose() # column vector
+    rv_trans = (T_trans * rv).transpose() # Matrix - vector multiplication
+                                          # and conversion to row vector
+
+    ret = []
+
+    # Construct all base vectors (in rotated system) with pos and neg directions
+    dim = len(point.values())
+    EVS = []
+    for i in xrange(dim):
+        ev = zeros(dim) # A zero vector in len(S) dimensions
+        # Set one of the coordinates to 1 or -1
+        ev[i] = 1 if plus else -1
+        EVS.append(ev)
+
+    # Get the eigentunes
+    for num, ev in enumerate(EVS):
+        thisEigentune  =  mySolve(rv_trans, ev, T, GOFdef, target)
+        ret.append([(num+1) if plus else -(num+1), thisEigentune])
+
+    return ret
+
+
+def calcHistoCov(h, COV_P, result):
+    """
+    Propagate the parameter covariance onto the histogram covariance
+    using the ipol gradients.
+    """
+    IBINS = h.bins
+    from numpy import zeros
+    COV_H = zeros((h.nbins, h.nbins))
+    from numpy import array
+    for i in xrange(len(IBINS)):
+        GRD_i = array(IBINS[i].grad(result))
+        for j in xrange(len(IBINS)):
+            GRD_j = array(IBINS[j].grad(result))
+            pc =GRD_i.dot(COV_P).dot(GRD_j)
+            COV_H[i][j] = pc
+    return COV_H
+
+
+def mkErrorPropagationHistos(IHISTOS, point, COV, combine=False):
+    covs = {}
+    properrs = {}
+    ipolerrs = {}
+    ipolvals = {}
+    from numpy import sqrt
+    for k, v in IHISTOS.iteritems():
+        covs[k]     = calcHistoCov(v, COV, point)
+        properrs[k] = sqrt(0.5*covs[k].diagonal())
+        ipolerrs[k] = [b.err  for b in v.toDataHisto(point).bins]
+        ipolvals[k] = [b.val  for b in v.toDataHisto(point).bins]
+
+    scatters=[]
+    for k, v in IHISTOS.iteritems():
+        T = v.toDataHisto(point)
+        for i in xrange(T.nbins):
+            T.bins[i].errs=properrs[k][i] if combine is False else sqrt(properrs[k][i]**2 + ipolerrs[k][i]**2)
+        scatters.append(T.toScatter2D())
+    return scatters
+
+
+def mkScatters(ipolH, ppoint):
+    scatters_e =[]
+    for k in sorted(ipolH.keys()):
+        v = ipolH[k]
+        T = v.toDataHisto(ppoint)
+        scatters_e.append(T.toScatter2D())
+    return scatters_e
+
+
+def mkEnvelopes(central, etunes):
+    ret = {}
+    for i in xrange(1, len(etunes.keys())/2 + 1):
+        ret[i] = []
+        Hplus  = etunes[i]
+        Hminus = etunes[-i]
+        for num_h, h in enumerate(central):
+            temp = h.clone()
+            for num_p, p in enumerate(temp.points):
+                yplus  = Hplus[num_h].points[num_p].y
+                yminus = Hminus[num_h].points[num_p].y
+                if yplus > p.y:
+                    eplus  = yplus - p.y
+                    eminus = p.y - yminus
+                else:
+                    eplus  = yminus - p.y
+                    eminus  = p.y - yplus
+                p.yErrs = (eminus, eplus)
+            ret[i].append(temp)
+    return ret
+
+
+def mkTotvelopes(central, etunes):
+    ret = []
+    for num_h, h in enumerate(central):
+        temp = h.clone()
+        allThis = [x[num_h] for x in etunes.values()]
+        for num_p, p in enumerate(temp.points):
+            dybin = [x.points[num_p].y - p.y for x in allThis]
+            pos = [x for x in dybin if x>=0]
+            neg = [x for x in dybin if x<0]
+            eplus = max(pos) if len(pos) > 0 else 0
+            eminus = abs(min(neg)) if len(neg) > 0 else 0
+            p.yErrs = (eminus, eplus)
+        ret.append(temp)
+    return ret
+
+
+def mkAddvelopes(central, etunes, addLinear=False):
+    ret = []
+    for num_h, h in enumerate(central):
+        temp = h.clone()
+        allThis = [x[num_h] for x in etunes.values()]
+        for num_p, p in enumerate(temp.points):
+            dybin = [x.points[num_p].y-p.y for x in allThis]
+            pos = [x for x in dybin if x>=0]
+            neg = [x for x in dybin if x<0]
+            from math import sqrt
+            if addLinear:
+                eplus  = sum(pos)                   if len(pos) > 0 else 0
+                eminus = sum([abs(x) for x in neg]) if len(neg) > 0 else 0
+            else:
+                eplus  = sqrt(sum([x*x for x in pos])) if len(pos) > 0 else 0
+                eminus = sqrt(sum([x*x for x in neg])) if len(neg) > 0 else 0
+            p.yErrs = (eminus, eplus)
+        ret.append(temp)
+    return ret
+
+
+def readFromFile(fname):
+    nbins = 0
+    params = []
+    ret = []
+    with open(fname) as f:
+        for line in f:
+            l = line.strip()
+            if l.startswith("#"):
+                if "Nbins" in l:
+                    nbins = int(l.split()[-1])
+                elif "Parameters" in l:
+                    params = l.split()[2:]
+            else:
+                ret.append(map(float, l.split()))
+    return ret, nbins, params
+
+# https://stackoverflow.com/questions/9535954/printing-lists-as-tabular-data
+def mkTabulate(head, rows):
+    from tabulate import tabulate
+    return tabulate(rows, headers=head,  tablefmt='orgtbl')
+
+def mkTable(head, rows):
+    t = head[0]
+    for h in head[1:]:
+        t+="\t%s"%str(h)
+
+    for row in rows:
+        t+="\n%s"%row[0]
+        for r in row[1:]:
+            t+="\t%s"%str(r)
+    t+="\n"
+
+    return t
+
+def mkEigentunesTable(ETs, rfile, latex=False):
+    import professor2 as prof
+    P_min, OTH = prof.readResult(opts.RESULT)
+
+    head = ["Tune"] + P_min.keys()
+
+    rows = [["Central"] + P_min.values()]
+
+    for e in sorted(list(set([abs(x) for x in ETs.keys()]))):
+        rows.append(["%i+"%e] + ETs[e] )
+        rows.append(["%i-"%e] + ETs[-e])
+
+    s="\nEigentune summary:\n\n"
+
+    try:
+        from tabulate import tabulate
+        s+=mkTabulate(head, rows)
+    except ImportError, e:
+        print e
+        print "Fallback to simple table"
+        s+=mkTable(head, rows)
+    return s
+
+
+import glob
+g_files = glob.glob("%s/*gof*.txt"%INDIR)
+c_files = glob.glob("%s/*covariance*.txt"%INDIR)
+m_files = glob.glob("%s/*results*.txt"%INDIR)
+
+
+import numpy as np
+NBINS, PNAMES = readFromFile(g_files[0])[1:]
+GOFS = np.array([readFromFile(x)[0] for x in g_files]).flatten()
+MINS = np.array([readFromFile(x)[0] for x in m_files]).reshape((len(GOFS), len(PNAMES)))
+
+
+OUTDIR = INDIR if opts.OUTDIR is None else opts.OUTDIR
+if not os.path.exists(OUTDIR):
+    os.makedirs(OUTDIR)
+
+# Central tuning result's GOF
+if opts.RESULT is not None:
+    import professor2 as prof
+    P_min, OTH = prof.readResult(opts.RESULT)
+    GOF_min = [float(x.split()[-1]) for x in OTH if "GOF" in x][0]
+else:
+    GOF_min=None
+mkGoFPlot(GOFS, NBINS-len(PNAMES), OUTDIR, GOF_min)
+
+# Distribution histograms for the minimisation result parameters
+for num, p in enumerate(PNAMES):
+    mkResDistPlot(MINS[:,num], p, OUTDIR)
+
+
+IHISTOS, METADATA = prof.read_ipoldata(IFILE)
+DBINS, IBINS, MAXERRS = prof.prepareBins(DHISTOS, IHISTOS, None, matchers, opts.FILTER)
+# F=mkFitFunc(DHISTOS, IFILE,None, matchers, opts.FILTER)
+F = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoF", ["DBINS", "IBINS", "MAXERRS"])
+
+
+import yoda
+if opts.RESULT is not None:
+    # Read the tuning result
+    import professor2 as prof
+    P_min, OTH = prof.readResult(opts.RESULT)
+    C_param = prof.getParamCov(OTH) # That's the minimiser covariance
+    # S, T_fwd are the return values if linalg.eig(COV)
+    # with S being the eigenvalues and T_fwd being composed of
+    # the eigenvalue problem: C_param = T_fwd * diagonalmatrix(S) * T_back
+    T_fwd, S, T_back = prof.eigenDecomposition(C_param) # S is vector, not a diagonal matrix
+
+    # Get the gof target according to the required percentile
+    import numpy as np
+    gof_target = np.percentile(GOFS, opts.PERCENTILE)
+
+    # Calculate the eigen tunes (points in parameter space)
+    E_plus  = mkEigentunes(T_fwd, T_back, P_min, F, gof_target)
+    E_minus = mkEigentunes(T_fwd, T_back, P_min, F, gof_target, plus=False)
+    ETs = dict(E_plus+E_minus)
+
+    # Print/save eigentunes
+    etable = mkEigentunesTable(ETs, opts.RESULT)
+    print etable
+    etableoutfname="%s/Eigentunes_%s.params"%(OUTDIR, str(opts.PERCENTILE))
+    with open(etableoutfname, "w") as f:
+        f.write(etable)
+    print "Stored Eigentune parameters in file %s"%etableoutfname
+
+    # Get the corresponding ipol histos
+    EThists = {}
+    for k, ET in ETs.iteritems():
+        thisEThists = mkScatters(IHISTOS, ET)
+        sgn = "+" if k > 0 else "-"
+        yoda.writeYODA(thisEThists, "%s/Eigentunes_%.1f_%i%s.yoda" % (OUTDIR,opts.PERCENTILE, int(abs(k)), sgn))
+        EThists[k]=thisEThists
+
+    # And for convenience corresponding envelopes
+    H_min = mkScatters(IHISTOS, P_min)
+    envelopes = mkEnvelopes(H_min, EThists)
+    for k, v in envelopes.iteritems():
+        yoda.writeYODA(v, "%s/EigentunesComb_%.1f_%i.yoda" % (OUTDIR,opts.PERCENTILE, k))
+
+    # This is the envelope of the eigentunes
+    totvelopes = mkTotvelopes(H_min, EThists)
+    # This is the deltas added in quadrature
+    quadvelopes = mkAddvelopes(H_min, EThists)
+    # This is the deltas added linearly
+    linvelopes = mkAddvelopes(H_min, EThists, addLinear=True)
+
+    yoda.writeYODA(totvelopes,  "%s/Totvelopes_%.1f.yoda"%(OUTDIR,opts.PERCENTILE))
+    yoda.writeYODA(quadvelopes, "%s/Quadvelopes_%.1f.yoda"%(OUTDIR,opts.PERCENTILE))
+    yoda.writeYODA(linvelopes,  "%s/Linvelopes_%.1f.yoda"%(OUTDIR,opts.PERCENTILE))
+
+    # This is a (conservative) symmetric real parameter covariance matrix reflecting the eigentunes
+    C_param_new = mkNewParamCorrelation(T_fwd, T_back, P_min, F, gof_target)
+
+    # This is now error propagation
+    yoda.writeYODA(mkErrorPropagationHistos(IHISTOS, P_min, C_param_new, combine=False),
+                   "%s/ih_comberr_eigcov_%.1f.yoda" % (OUTDIR, opts.PERCENTILE))
+    yoda.writeYODA(mkErrorPropagationHistos(IHISTOS, P_min, C_param, combine=False),
+                   "%s/ih_comberr_mincov_%.1f.yoda" % (OUTDIR,opts.PERCENTILE))

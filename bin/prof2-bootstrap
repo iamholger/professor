@@ -1,0 +1,300 @@
+#! /usr/bin/env python
+
+"""\
+%prog -d <datadir> -m <resultsfile> [ipolfile(s)] [opts]
+
+Read in a minimisation result, datadir and ipolfile(s) to
+bootstrap the chi2 distribution.
+
+This script is experimental as the distribution and error
+handling is not fully understood.
+
+The intention is to use the Delta Chi2 values calculated
+at the end as input for the eigentunes, i.e. for
+    prof2-eigentunes --target=DELTACHI
+
+"""
+
+def smearDataHistos(histDict):
+    from math import sqrt
+    rdict = {}
+    for k, v in histDict.iteritems():
+        DH = prof.DataHisto(v.bins, v.path).mkSmearedCopy(sqrt(2.))
+        rdict[k] = DH
+    return rdict
+
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-d", "--datadir", dest="DATADIR", default=None, help="The data directory")
+op.add_option("-m", "--minres", dest="RESULT",  default=None, help="Minimisation result to use for eigentunes calculation")
+op.add_option("-o", "--outdir", dest="OUTDIR", default="bootstrap", help="Output directory")
+op.add_option("-r", "--runsdir", dest="RUNSDIR", default=None, help="The runs directory")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+op.add_option("--pname", "--pfile", dest="PNAME", default="params.dat", help="Name of the params file to be found in each run directory (default: %default)")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict ipol building to a subset of bins (default: %default)")
+op.add_option("--limit-errs", dest="USE_RUNSDIR", action="store_true", default=False, help="Re-read the runsdir to regularise error ipols")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--filter", dest="FILTER", action="store_true", default=False, help="Filter out data bins that have 0 error")
+op.add_option("--scan-n", dest="SCANNP", default=None, type=int, help="Number of test points find a good migrad start point (default: %default)")
+op.add_option("--scan-sampler", dest="SCANSAMPLER", default="latin", help="Sampler to use for start point finding uniform|latin|sobol (default: %default)")
+op.add_option("--scan-seed", dest="SCANSEED", default=0, type=int , help="Sampler seed (default: %default)")
+op.add_option("--ierr",  dest="ERR_MODE", default="symm", help="Whether to interpolate MC errors: none, mean, median, symm (default: %default)") #< add rel, asymm
+op.add_option("--order", dest="ORDER", default=3, type=int, help="Global order of polynomials for interpolation")
+op.add_option("--eorder", dest="ERR_ORDER", default=None, type=int, help="Global order of polynomials for uncertainty interpolation (default: same as from --order)")
+op.add_option("-n", dest="NSAMPLES", type=int,  default=1, help="Number of samples")
+op.add_option("-j", dest="MULTI", type=int, default=1, help="Number of threads to use")
+op.add_option("--logy", dest="LOGY", action="store_true", default=False, help="Parametrise the logy of read in values. (Experimental)")
+op.add_option("--auto-omin",  dest="AUTO_OMIN", type=int, default=0,  help="Minimum allowed order with --order auto")
+op.add_option("--auto-omax",  dest="AUTO_OMAX", type=int, default=4,  help="Maximum allowed order with --order auto")
+op.add_option("--auto-nit",   dest="AUTO_NIT",  type=int, default=10, help="Number of iteration with --order auto")
+op.add_option("--auto-split",   dest="AUTO_SPLIT",  type=float, default=0.2, help="Fraction of test sample with --order auto")
+op.add_option("--medianfilt",   dest="MEDIAN_FILT",  type=float, default=-1, help="Bin-wise filtering of inputs by median relative error. (Experimental)")
+op.add_option("--smear-data",   dest="SMEARDATA", action="store_true", default=False, help="Smear the data")
+op.add_option("--smear-signal", dest="SMEARSIGNAL", action="store_true", default=False, help="Smear the signal")
+opts, args = op.parse_args()
+
+
+
+
+## Get mandatory arguments, same as prof2-tune
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+REFDIR = opts.DATADIR
+if REFDIR is None:
+    print "Error, no data directory specified (-d/--datadir), exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+IFILES = args
+
+RUNSDIR = opts.RUNSDIR
+if RUNSDIR is None:
+    print "Error, no runs directory specified (-r/--runsdir), exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+
+# Sanity
+if not os.path.exists(REFDIR):
+    print "Error, specified data directory '%s' does not exist, exiting\n\n"%REFDIR
+    op.print_usage()
+    sys.exit(1)
+if not os.path.exists(opts.OUTDIR):
+    os.makedirs(opts.OUTDIR)
+
+if opts.RESULT is None:
+    print "Error, no result file given"
+    sys.exit(1)
+
+## Load Professor and show the standard banner
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+# Read data files
+DHISTOS = prof.read_all_histos(REFDIR)
+
+# Jeez Louis
+PARAMS, HISTOS = prof.read_all_rundata(RUNSDIR, opts.PNAME)
+
+## Weight file parsing --- by default read from results file
+MATCHERS = prof.read_pointmatchers(opts.WFILE) if opts.WFILE else prof.read_pointmatchersfromresults(opts.RESULT)
+
+## Try to read run histos and extract maximum errors --- NOTE this bit might be broken with patches NOTE
+MAXERRDICT = None
+if opts.USE_RUNSDIR:
+    try:
+        _, RUNHISTOS = prof.read_all_rundata(RUNSDIR, None) #< don't care about reading params files
+        MAXERRDICT = prof.find_maxerrs(RUNHISTOS)
+    except:
+        print "Could not read run data for error regularisation -- chi2 may be unstable"
+
+def mkBoxAndCtr(ifiles, dhistos):
+    from collections import OrderedDict
+    mbox=OrderedDict()
+    mctr=OrderedDict()
+    for f in ifiles:
+        box, center, fitdata = prof.prepareBox(f, dhistos, MATCHERS, MAXERRDICT, opts.FILTER, opts.DEBUG)
+        # Little extra bit since we need the anchor points for smearing
+        USEDRUNS = prof.read_ipolmeta(f)["Runs"].split()
+        from collections import OrderedDict
+        USEDPARAMS = OrderedDict()
+        for k, v in PARAMS.iteritems():
+            if k in USEDRUNS:
+                USEDPARAMS[k] = v
+        test=dict(fitdata)
+        test["USEDPARAMS"] = USEDPARAMS
+        mbox[box]=test
+        mctr[center]=mbox[box]
+    return mbox, mctr
+
+MASTERBOX, MASTERCENTER = mkBoxAndCtr(IFILES, DHISTOS)
+
+[DHISTOS.pop(x) for x in DHISTOS.keys() if not x in MASTERBOX.values()[0]["IHISTOS"].keys()]
+
+## Take parameter names from the first box and assert that all other boxes (if present) have the same names
+PNAMES=MASTERBOX.values()[0]["PNAMES"]
+
+# Central tuning result's GOF, min/max paramvalues
+P_min, OTH = prof.readResult(opts.RESULT)
+
+
+
+if opts.LIMITS is not None:
+    import professor2 as prof
+    limits, fixed = prof.read_limitsandfixed(LIMITFILE)
+else:
+    # Fixed Parameters
+    fixed=prof.getFixedParams(OTH)
+    # Parameter limits
+    limits=prof.getParamLimits(OTH)
+
+
+def mkSmearedIpolBox(inBox, inHist):
+    import math
+
+    newIpolFiles=[]
+
+    # Iterate over boxes (i.e. parameter space patches)
+    for box in inBox.values():
+        myHISTOS = {} #{'HISTONAME': {'0000': <Histo with 0 bins>}}
+
+        # Smearing and preparation of ipol input
+        for hname, runDict in inHist.iteritems():
+            if not hname in box["IHISTOS"].keys():
+                continue
+            temp = {}
+            for run, params in box["USEDPARAMS"].iteritems():
+                temp[run] = prof.DataHisto(runDict[run].bins, runDict[run].path).mkSmearedCopy(math.sqrt(2))#ihist.toDataHisto(params).mkSmearedCopy()
+            myHISTOS[hname] = temp
+
+        myUSEDRUNS, myPARAMNAMES, myPARAMSLIST = prof.mk_ipolinputs(box["USEDPARAMS"])
+        myHNAMES = sorted(box["IHISTOS"].keys())
+
+        # print opts.MULTI
+        CONFIG = {"MULTI":opts.MULTI, "ORDER":opts.ORDER, "ERR_MODE":opts.ERR_MODE, "ERR_ORDER":opts.ERR_ORDER, "QUIET":opts.QUIET, "DEBUG":opts.DEBUG}
+        CONFIG["AUTO_OMIN"] = opts.AUTO_OMIN
+        CONFIG["AUTO_OMAX"] = opts.AUTO_OMAX
+        CONFIG["AUTO_NIT"] = opts.AUTO_NIT
+        CONFIG["AUTO_SPLIT"] = opts.AUTO_SPLIT
+        CONFIG["MEDIAN_FILT"] = opts.MEDIAN_FILT
+        CONFIG["LOGY"]=opts.LOGY
+        tempDict = prof.mkStandardIpols(myHISTOS, myHNAMES, myUSEDRUNS, myPARAMSLIST, CONFIG, referenceIpolSet=box["IHISTOS"], quiet=opts.QUIET)
+        temp = prof.writeIpol("temp", tempDict, [myPARAMNAMES, myPARAMSLIST], box["USEDPARAMS"].keys(), "", "")
+        newIpolFiles.append(temp.name)
+
+    return newIpolFiles
+
+pmins, pmaxs, pminmax = [], [], []
+for num, pname in enumerate(PNAMES):
+    testmin = [box[num][0] for box in MASTERBOX.keys()]
+    testmax = [box[num][1] for box in MASTERBOX.keys()]
+    pmins.append(min(testmin))
+    pmaxs.append(max(testmax))
+    pminmax.append([min(testmin), max(testmax)])
+
+def mkGoFPlot(X, Xtune, outputfile):
+    import numpy as np
+    g_68 = np.percentile(X, 68.8)
+    g_95 = np.percentile(X, 95)
+    g_99 = np.percentile(X, 99.9)
+
+    import pylab
+    pylab.axvspan(min(X), g_68, label="68.8 pct", facecolor="b", alpha=0.1)
+    pylab.axvspan(g_68, g_95, label="95 pct", facecolor="r", alpha=0.1)
+    # pylab.axvspan(g_95, g_99, label="99.9 pct", facecolor="g", alpha=0.1)
+    pylab.hist(X, "auto", normed=True, histtype="step")
+    pylab.axvline(Xtune, label="Tune")
+    pylab.legend()
+    pylab.xlabel(r"$\phi^2$")
+    pylab.ylabel(r"$p(X = \phi^2)$")
+    pylab.savefig(outputfile)
+
+
+def mkSingleTune(mbox, mctr):
+    import professor2 as prof
+    funcdef = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoF", ["mbox", "mctr", "False"])
+    exec funcdef in locals()
+    # Unless we do a scan first, choose the center of param space as startpoint
+    pstart = [(pmins[i] + pmaxs[i])/2. for i in xrange(len(pmins))]
+
+    # Scan for better start point
+    if opts.SCANNP is not None:
+        npoints = opts.SCANNP
+        startSampler= prof.NDSampler(pminmax, sampler=opts.SCANSAMPLER, seed=opts.SCANSEED)
+        startPoints = [startSampler() for _ in xrange(npoints)]
+        if not opts.QUIET:
+            print "Scanning %i points" % (npoints)
+        testVals = [profGoF(*x) for x in startPoints]
+        winner = startPoints[testVals.index(min(testVals))]
+
+        ## This sets the start point
+        if not opts.QUIET:
+            print "Using startpoint that yieldes fval %e:"%min(testVals)
+        for i, aname in enumerate(PNAMES):
+            pstart[i] = winner[i]
+            if not opts.QUIET:
+                print "%s = %f"%(aname, pstart[i])
+
+    ## Dictionary fitarg for iminuit
+    FARG=prof.setupMinuitFitarg(PNAMES, pstart, pmins, pmaxs, limits=limits, fixed=fixed, allowExtrapolation=False, verbose=False)
+    from iminuit import Minuit
+    minuit = Minuit(profGoF, errordef=1, print_level=0 if opts.QUIET else 1, forced_parameters=PNAMES, **FARG)
+    minuit.strategy = 2
+
+    import time
+    start_time = time.time()
+    ## Lift off
+    minuit.migrad()
+    if not opts.QUIET:
+        print("Minimisation finished after %s seconds" % (time.time() - start_time))
+
+    chi2 = minuit.fval
+    return chi2
+
+
+default=mkSingleTune(MASTERBOX, MASTERCENTER)
+
+newvals=[]
+
+MSGEVERY = int(opts.NSAMPLES/20.) if opts.NSAMPLES > 20 else 1;
+for i in xrange(opts.NSAMPLES):
+    if opts.SMEARDATA:
+        smearedDhists=smearDataHistos(DHISTOS)
+    else:
+        smearedDhists=DHISTOS
+
+    if opts.SMEARSIGNAL:
+        smearedIfiles=mkSmearedIpolBox(MASTERBOX, HISTOS)
+        newBOX, newCTR = mkBoxAndCtr(smearedIfiles, smearedDhists)
+    else:
+        newBOX, newCTR = mkBoxAndCtr(IFILES, smearedDhists)
+
+    temp=mkSingleTune(newBOX, newCTR)
+    newvals.append(temp)
+    if i%MSGEVERY ==0:
+        sys.stderr.write('\rProgress: {current}/{total}\r'.format(current=i, total=opts.NSAMPLES))
+
+GOF_min = [float(x.split()[-1]) for x in OTH if "GOF" in x][0]
+import numpy
+numpy.savetxt(os.path.join(opts.OUTDIR, "bootstrap_gof_%i.txt"%opts.NSAMPLES), newvals)
+mkGoFPlot(newvals, GOF_min, os.path.join(opts.OUTDIR, "bootstrap_gof_%i.pdf"%opts.NSAMPLES))
+
+import numpy as np
+g_68 = np.percentile(newvals, 68.8)
+g_95 = np.percentile(newvals, 95)
+g_99 = np.percentile(newvals, 99.9)
+
+print "These are the delta Phi2 values:"
+print "68.8 at %.4f --- DeltaPhi2 = %.4f"%(g_68, g_68-GOF_min)
+print "95   at %.4f --- DeltaPhi2 = %.4f"%(g_95, g_95-GOF_min)
+print "99.9 at %.4f --- DeltaPhi2 = %.4f"%(g_99, g_99-GOF_min)
+
+
+
+
+print "Done. Output written to", opts.OUTDIR
+
+sys.exit(0)

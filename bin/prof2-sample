@@ -1,0 +1,281 @@
+#! /usr/bin/env python
+
+"""\
+%prog [-o out1] [-t template1.txt -t ...] PARAM1:low1:high1 PARAM2:low2:high2:'exp(x)'
+or
+%prog [-o out1] [-t template1.txt -t ...] myparamfile
+
+Sample a parameter space, creating a set of parameter files and optionally
+substituting into script templates, with either flat sampling (default) or
+sampling in a transformed space.
+
+Parameter ranges (and bias functions) can either be given inline on the command line,
+with the name, low..high range, and optional bias function separated by colons (:),
+or in a parameter range file with one parameter per line and whitespace separation of
+the name, low, high, and bias terms.
+
+TODO:
+ * copy the file mode (esp. executable) from the template to each instantiation
+"""
+
+import optparse
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-n", dest="NUMPOINTS", metavar="NUM", type=int, default=100, help="number of samples to generate [default=%default]")
+op.add_option("-t", dest="TEMPLATES", metavar="FILE", action="append", default=[], help="specify a template file to be populated for each sample point. Can be given multiple times. Strings in curly braces are instantiated.")
+op.add_option("-o", "--outdir", dest="OUTDIR", metavar="DIR", default="scan", help="specify the output directory name (default: %default)")
+op.add_option("-m", "--outmode", dest="OUTMODE", metavar="MODE", default="hier", help="specify the output structuring mode: either 'hier' (default) or 'flat' to respectively use run subdirs or not or 'table' to create one text file with a table like structure")
+op.add_option("-p", "--pfile", dest="PARAMSFILE", metavar="FILE", default="params.dat", help="specify params file base name to be populated for each sample point")
+op.add_option("-s", "--seed", dest="SEED", metavar="VAL", type=int, default=None, help="Random seed for the sampler (default: %default)")
+op.add_option("-f", "--overlapfraction", dest="OVERLAP", default=0, type=float, help="Fraction (0.1 means 10 per cent) of axis overlap when sampling multiple patches (default: %default)")
+op.add_option("--veto", dest="VETOFN", metavar="FILE", default=None, help="specify a file from which to read the definition of a Python sample point-vetoing function, prof_sample_veto(paramsdict). Return True means 'veto point'")
+op.add_option("--sampler", dest="SAMPLER", default="uniform", help="Select sampling method uniform|latin|sobol (default: %default)")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+opts, args = op.parse_args()
+assert opts.OUTMODE in ("hier", "flat", "table")
+
+
+if opts.SAMPLER not in ["uniform", "sobol", "latin", "grid"]:
+    print "Error, requested sampling method '%s' not found, exiting"%opts.SAMPLER
+    import sys
+    sys.exit(1)
+
+
+if opts.SAMPLER=="sobol" and opts.SEED>100000:
+    print "Warning, sobol sampling is slow for seed > 100000, current seed: %i"%opts.SEED
+
+import os
+
+def mkrunstr(num):
+    return "{run:04d}".format(run=num)
+
+def mkoutname(fname, run, prefix="", suffix=""):
+    if type(run) is int:
+        run = mkrunstr(run)
+    if opts.OUTMODE == "hier":
+        name = os.path.join(run, fname)
+    elif opts.OUTMODE == "flat":
+        fname = os.path.basename(fname)
+        base, ext = os.path.splitext(fname)
+        name = prefix + base + "-" + run + suffix + ext
+        print "Name:", name
+    elif opts.OUTMODE == "table":
+        name=fname
+    return os.path.join(opts.OUTDIR, name)
+
+def mkdir(path):
+    d = os.path.dirname(path) #< if path is to a dir, make sure to terminate with a /
+    if not os.path.exists(d):
+        os.makedirs(d)
+
+def sample(sdict, N, fveto, sampler="uniform", seed=None):
+    ## Do random param sampling and template instantiation
+    PPoints=[]
+    ranges = [[float(x[0].low), float(x[0].high)] for x in sdict.values()]
+    biases = [x[1] for x in sdict.values()]
+    pnames = sdict.keys()
+
+    from professor2 import NDSampler
+    ND=NDSampler(ranges, biases, sampler=sampler, seed=seed)
+    for n in xrange(N):
+        # npad = mkrunstr(n)
+
+        ## Populate params dictionary
+        while True:
+            params = OrderedDict.fromkeys(pnames)
+            point = ND()
+            for num, p in enumerate(pnames):
+                params[p]=point[num]
+            ## Allow a user function to veto the point
+            if fveto is not None and fveto(params):
+                continue #< try sampling again
+            PPoints.append(params)
+            break #< successful sample: proceed
+
+    return PPoints
+
+# https://stackoverflow.com/questions/12864445/numpy-meshgrid-points/12891609
+def meshgrid2(*arrs):
+    import numpy as np
+    arrs = tuple(reversed(arrs))
+    lens = map(len, arrs)
+    dim = len(arrs)
+    sz = 1
+    for s in lens:
+       sz *= s
+    ans = []
+    for i, arr in enumerate(arrs):
+        slc = [1]*dim
+        slc[i] = lens[i]
+        arr2 = np.asarray(arr).reshape(slc)
+        for j, sz in enumerate(lens):
+            if j != i:
+                arr2 = arr2.repeat(sz, axis=j)
+        ans.append(arr2)
+    return tuple(ans)
+
+
+def grid(sdict, N):
+    """
+    Create a grid of points in the paramspace.
+    """
+    PPoints=[]
+    ranges = [[float(x[0].low), float(x[0].high)] for x in sdict.values()]
+    pnames = sdict.keys()
+    if type(N)==list:
+        assert(len(N)==len(pnames))
+    from collections import OrderedDict
+    lsps = OrderedDict()
+    import numpy
+    for num, pname in enumerate(pnames):
+        lsps[pname]=numpy.linspace(*ranges[num], num=N)
+    print lsps
+
+    import numpy as np
+    G = meshgrid2(*lsps.values())
+    Gpoints = np.vstack(map(np.ravel, G)).T
+    PP=[]
+    for v in Gpoints:
+        od = OrderedDict.fromkeys(pnames)
+        for num, pname in enumerate(pnames):
+            od[pname] = v[num]
+        PP.append(od)
+
+    return PP
+
+def writeParams(P, outdir, subdir, fname, templates, mode):
+    from os.path import join, exists
+    for num, p in enumerate(P):
+        npad = mkrunstr(num)
+        if mode == "hier":
+            outd = join(outdir, subdir, npad)
+            outf = join(outd, fname)
+        else:
+            outd = join(outdir, subdir)
+            newfname = "%s.%s"%(fname, npad)
+            outf = join(outd, newfname)
+
+        if not exists(outd):
+            import os
+            os.makedirs(outd)
+
+        with open(outf, "w") as pf:
+            for k, v in p.iteritems():
+                pf.write("{name} {val:e}\n".format(name=k, val=v))
+
+        ## Instantiate template(s)
+        if mode=="hier":
+            p["N"] = npad #< Add the run number *after* writing out the params file
+            for tbasename, tmpl in templates.iteritems():
+                txt = tmpl.format(**p)
+                tname = join(outd, tbasename)
+                with open(tname, "w") as tf:
+                    tf.write(txt)
+
+
+
+## Populate dict of script templates
+TEMPLATES = {}
+for t in opts.TEMPLATES:
+    tname = os.path.basename(t)
+    with open(tname, "r") as f:
+        TEMPLATES[tname] = f.read()
+
+
+## Populate param samplers dictionary
+from professor2 import Sampler
+try:
+    from collections import OrderedDict
+except:
+    from ordereddict import OrderedDict
+
+samplers = OrderedDict()
+
+with open(args[0], "r") as prf:
+    for line in prf:
+        line = line.split("#")[0].strip() #< strip comments and whitespace
+        if line:
+            parts = line.split()
+            name = parts[0]
+            samplers[name]=[]
+            try:
+                float(parts[-1])
+                bias = None
+            except ValueError:
+                bias = parts[-1]
+            Nsub = len(parts)-1 if bias is None else len(parts)-2
+            for i in xrange(Nsub-1):
+                if len(parts[1:])>2:
+                    distance = float(parts[2+i]) - float(parts[1+i])
+                    dx = opts.OVERLAP*distance
+                    # Left edge stays left edge
+                    if i==0:
+                        subsampler = Sampler(float(parts[1+i]), float(parts[2+i])+dx)
+                    # Right edge stays right edge
+                    elif i==len(parts[1:])-2:
+                        subsampler = Sampler(float(parts[1+i])-dx, float(parts[2+i]))
+                    # Some guy in the middle, add overlap on both sides
+                    else:
+                        subsampler = Sampler(float(parts[1+i])-dx, float(parts[2+i])+dx)
+                # For parameter axes with only one patch
+                else:
+                    subsampler = Sampler(float(parts[1+i]), float(parts[2+i]))
+
+                if opts.DEBUG:
+                    print name, subsampler
+
+                samplers[name].append((subsampler, bias))
+
+# This makes all the patches.
+# https://stackoverflow.com/questions/798854/all-combinations-of-a-list-of-lists
+import itertools
+patches = list(itertools.product(*samplers.values()))
+
+# Make a dictionary that the NDsampler understands for each patch
+patchDicts = []
+for p in patches:
+    stemp = OrderedDict.fromkeys(samplers.keys())
+    for num, k in enumerate(stemp.keys()):
+        stemp[k] = p[num]
+    patchDicts.append(stemp)
+
+
+## Load a point veto function if supplied by the user
+if opts.VETOFN:
+    execfile(opts.VETOFN)
+    assert "prof_sample_veto" in dir()
+    opts.VETOFN = prof_sample_veto
+
+# Sample points and write/print out
+if opts.SEED is None:
+    import time
+    useSEED=int(time.time())
+    if opts.SAMPLER=="sobol":
+        useSEED=useSEED%100000
+        print "INFO: sobol doesn't like large seeds, converted system time seed to %i"%useSEED
+else:
+    useSEED=opts.SEED
+
+for num, p in enumerate(patchDicts):
+
+    if opts.SAMPLER=="grid":
+        PP = grid(p, opts.NUMPOINTS)
+    else:
+        PP = sample(p, opts.NUMPOINTS, opts.VETOFN, opts.SAMPLER, useSEED)
+
+    if not opts.OUTMODE=="table":
+        if len(patchDicts)==1:
+            subdir=""
+        else:
+            subdir="sub%i"%num
+        writeParams(PP, opts.OUTDIR, subdir, opts.PARAMSFILE, TEMPLATES, opts.OUTMODE)
+    else:
+        t = "#"
+        for k in p.keys():
+            t+= " %s"%k
+        for point in PP:
+            x=point.values()
+            t+="\n"
+            for i in x:
+                t+="%e "%i
+        print t

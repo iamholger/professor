@@ -1,0 +1,181 @@
+#! /usr/bin/env python
+
+"""\
+%prog <runsdir> [<ipolfile>=ipol.dat] [opts]
+
+Compute and plot the relative deviations of the given interpolation from the
+corresponding sample points in the given <runsdir>, for both bin values and bin
+errors. Histograms are made for each histogram independently (summed over bins and MC
+points), and for the sum over all histos and bins, and are written to PDFs and
+to a res.yoda data file.
+
+This can be useful for determining whether the interpolation is providing a
+sufficiently faithful approximation to the true observables, and choosing the
+most appropriate order of fit polynomial. It can also be useful to detect
+overfitting, by comparing residuals distributions between the set of runs used
+to make the fit (via prof-ipol) and an equivalent set not included in the fit.
+
+TODO:
+ * Allow control over the output filenames / directory.
+ * Add an option for value-only (no err) residuals
+ * Support runcomb filtering
+"""
+
+
+from __future__ import print_function
+
+import matplotlib, os
+matplotlib.use(os.environ.get("MPL_BACKEND", "Agg"))
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+#op.add_option("--ifile", dest="IFILE", default="ipol.dat", help="file from which to read the bin interpolations (default: %default)")
+op.add_option("--pname", "--pfile", dest="PNAME", default="params.dat", help="name of the params file to be found in each run directory (default: %default)")
+op.add_option("--xrange", dest="XRANGE", default=0.5, type=float, help="the +- range of relative deviation to display (default: %default)")
+op.add_option("--nbins", dest="NBINS", default=30, type=int, help="number of bins in relative residuals histograms (default: %default)")
+op.add_option("--no-plots", dest="NO_PLOTS", action="store_true", default=False, help="don't write histogram PDFs (default: %default)")
+op.add_option("--tot-only", dest="ONLY_TOT", action="store_true", default=False, help="only make total residuals histograms, not per-observable (default: %default)")
+op.add_option("--logx", dest="LOG_BINS", action="store_true", default=False, help="use a symmetric log binning for better resolution around 0 (default: %default)")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+opts, args = op.parse_args()
+
+## Get mandatory arguments
+if len(args) < 1:
+    print("Argument missing... exiting\n\n", file=sys.stderr)
+    op.print_usage()
+    sys.exit(1)
+RUNSDIR = args[0]
+IFILE = "ipol.dat"
+if len(args) >= 2:
+    IFILE = args[1]
+
+
+## Load the Professor machinery
+import professor2 as prof
+if not opts.QUIET:
+    print(prof.logo)
+
+## No point in going further if YODA isn't available, too
+try:
+    import yoda
+except ImportError:
+    print("YODA is required by this tool... exiting", file=sys.stderr)
+    sys.exit(1)
+
+
+## Load MC run histos and params
+# TODO: add runcomb file parsing to select a runs subset
+try:
+    PARAMS, HISTOS = prof.read_all_rundata(RUNSDIR, opts.PNAME)
+    RUNS, PARAMNAMES, PARAMSLIST = prof.mk_ipolinputs(PARAMS)
+except Exception, e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+
+## Load interpolated histograms from file
+IHISTOS, IMETA = prof.read_ipoldata(IFILE)
+print("Loaded ipol histos from", IFILE)
+
+
+## Set up residuals histo binnings
+hedges = None
+if opts.LOG_BINS:
+    ## Determine central linear bin (half) size:
+    ## dx1 == exp(ln(xmin) + (ln(xmax) - ln(xmin))/nbins) - xmin
+    ##  => set xmin <= dx1 for monotonic bin sizes:
+    ##  => ln(2*xmin) == ln(xmin)(1 - 1/nbins) + ln(xmax)/nbins
+    ##  => ln(xmin) == ln(xmax) - ln(2)*nbins
+    ##  => xmin == exp( ln(xmax) - ln(2)*nbins )
+    eps = opts.XRANGE*(3**-(opts.NBINS//2))
+    edges1 = yoda.logspace(opts.NBINS//2, eps, opts.XRANGE)
+    hedges = [-e for e in reversed(edges1)] + edges1
+else:
+    hedges = yoda.linspace(opts.NBINS, -opts.XRANGE, opts.XRANGE)
+if opts.DEBUG:
+    print("Histogram bin edges = ", hedges)
+
+## Set up total residuals histograms
+hresvaltot = yoda.Histo1D(hedges, path="/TOT/resval")
+hreserrtot = yoda.Histo1D(hedges, path="/TOT/reserr")
+aos = [hresvaltot, hreserrtot]
+
+
+RESLOG = open("res.log", "w")
+
+def log(*args):
+    print(*args, file=RESLOG)
+    if not opts.QUIET:
+        print(*args)
+
+if not opts.NO_PLOTS:
+    from matplotlib import pyplot as plt
+
+if not opts.QUIET:
+    print()
+
+## Loop over histograms and compute residuals histos
+for hn, mchistos in sorted(HISTOS.iteritems()):
+    hnstr = hn.replace("/", "_").strip("_")
+
+    hresval = yoda.Histo1D(hedges, path=hn+"/resval")
+    hreserr = yoda.Histo1D(hedges, path=hn+"/reserr")
+
+    if hn in IHISTOS.keys():
+        ihisto = IHISTOS[hn]
+        for irun, run in enumerate(RUNS):
+            if not run in mchistos.keys():
+                continue
+            mchisto = mchistos[run]
+            assert mchisto.nbins == ihisto.nbins
+            for ib in xrange(ihisto.nbins):
+
+                ## Value residuals
+                absres = ihisto.bins[ib].val(PARAMSLIST[irun]) - mchisto.bins[ib].val
+                # print(irun, ib, absres)
+                if mchisto.bins[ib].val != 0:
+                    relres = absres / mchisto.bins[ib].val
+                    hresval.fill(relres)
+                    hresvaltot.fill(relres)
+
+                ## Error residuals
+                # print(ihisto.bins[ib].err(PARAMSLIST[irun]) , mchisto.bins[ib].err)
+                absres = ihisto.bins[ib].err(PARAMSLIST[irun]) - mchisto.bins[ib].err
+                import math
+                if math.isnan(mchisto.bins[ib].err):
+                    continue
+                if mchisto.bins[ib].err != 0:
+                    relres = absres / mchisto.bins[ib].err
+                    hreserr.fill(relres)
+                    hreserrtot.fill(relres)
+
+    if not opts.ONLY_TOT:
+        aos += [hresval, hreserr]
+
+        if hresval.numEntries() > 0:
+            log(hn, "value:", "mean =", hresval.xMean(), "stddev =", hresval.xStdDev())
+            if not opts.NO_PLOTS:
+                f, _ = yoda.plot(hresval, "res_val_" + hnstr + ".pdf", plotkeys={"Title": hn})
+                plt.close(f)
+
+        if hreserr.numEntries() > 0:
+            log(hn, "error:", "mean =", hreserr.xMean(), "stddev =", hreserr.xStdDev())
+            if not opts.NO_PLOTS:
+                f, _ = yoda.plot(hreserr, "res_err_" + hnstr + ".pdf", plotkeys={"Title": hn})
+                plt.close(f)
+
+        if hresval.numEntries() > 0 or hreserr.numEntries() > 0:
+            log()
+
+if hresvaltot.numEntries() > 0:
+    log("Tot val", "mean =", hresvaltot.xMean(), "stddev =", hresvaltot.xStdDev())
+    if not opts.NO_PLOTS:
+        yoda.plot(hresvaltot, "res_val_tot.pdf")
+
+if hreserrtot.numEntries() > 0:
+    log("Tot err", "mean =", hreserrtot.xMean(), "stddev =", hreserrtot.xStdDev())
+    if not opts.NO_PLOTS:
+        yoda.plot(hreserrtot, "res_err_tot.pdf")
+
+RESLOG.close()
+yoda.write(aos, "res.yoda")

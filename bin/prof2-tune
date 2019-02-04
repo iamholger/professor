@@ -1,0 +1,403 @@
+#! /usr/bin/env python
+
+"""\
+%prog -d <refdir> [<ipolfiles>=ipol.dat ...] [-r <runsdir>=<refdir>/../mc] [opts]
+
+Use the interpolations stored in <ipolfile> to find optimised parameters with
+the reference histograms found in the <refdir> as the optimisation target.
+
+The <runsdir> is used to calculate the maximum error value seen for each bin,
+to regularise interpolated errors which could otherwise blow up, leading to
+an unrepresentative small chi2 (and hence fit result) outside the sampled ranges.
+
+
+WEIGHT FILE SYNTAX:
+
+The weight file syntax is derived from YODA path syntax, and allows selecting bin
+ranges either by physical value or by bin number, e.g.
+
+  /path/parts/to/histo            weight
+  /path/parts/to/histo#n          weight
+  /path/parts/to/histo@x          weight
+  /path/parts/to/histo@xmin:xmax  weight
+  /path/parts/to/histo#nmin:nmax  weight
+
+Blank lines and lines starting with a # symbol will be ignored.
+
+The bin indices used with the # syntax start at 0, and the end index in a
+range is non-inclusive. In the range form, if xmin/nmin or xmax/nmax is left
+blank, it defaults to the accepting all bins from the start of the histogram,
+or all bins to the end of the histogram respectively.
+
+TODO:
+ * Include correlations in the tuning and resampling.
+ * Handle run combination file/string (write a hash of the run list into the ipol filename?)
+"""
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-d", "--datadir", dest="DATADIR", default=None, help="The data directory")
+op.add_option("-r", "--runsdir", dest="RUNSDIR", default=None, help="The runs directory")
+op.add_option("-w", "--wfile", dest="WFILE", default=None, help="Path to a weight file to specify unequal chi2 weights of each bin in the fit (default: %default)")
+op.add_option("-o", "--outdir", dest="OUTDIR", default="tunes", help="Prefix for outputs (default: %default)")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--minos", dest="MINOS", default=False, action="store_true", help="Run Minos algorithm after minimisation")
+op.add_option("--limit-errs", dest="USE_RUNSDIR", action="store_true", default=False, help="Re-read the runsdir to regularise error ipols")
+op.add_option("--norm-weights", dest="NORMW", action="store_true", default=False, help="Divide obserbable weight by number of regular bins")
+op.add_option("-x", "--allowextrapolation", dest="EXTRAPOLATE", action="store_true", default=False, help="Allow the minimiser to go into region of extrapolation")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="Turn off messages")
+op.add_option("-s", "--strategy", dest="STRATEGY",  default=2, type=int, help="Set Minuit strategy [0 fast, 1 standard, 2 slow]")
+op.add_option("--filter", dest="FILTER", action="store_true", default=False, help="Filter out data bins that have 0 error")
+op.add_option("--profiles", dest="PROFILES", action="store_true", default=False, help="Draw Minos and MIGRAD profiles")
+op.add_option("--contours", dest="CONTOURS", action="store_true", default=False, help="Draw Minos and MIGRAD contours")
+op.add_option("--scan-n", dest="SCANNP", default=None, type=int, help="Number of test points find a good migrad start point (default: %default)")
+op.add_option("--scan-sampler", dest="SCANSAMPLER", default="uniform", help="Sampler to use for start point finding uniform|latin|sobol (default: %default)")
+op.add_option("--scan-seed", dest="SCANSEED", default=0, type=int , help="Sampler seed (default: %default)")
+opts, args = op.parse_args()
+
+try:
+    from iminuit import Minuit
+except ImportError, e:
+    print "Unable to import iminuit, exiting", e
+    print "Try installing iminuit with pip: pip install iminuit --user"
+    sys.exit(1)
+
+## Get mandatory arguments
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+REFDIR = opts.DATADIR
+if REFDIR is None:
+    print "Error, no data directory specified (-d/--datadir), exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+IFILES = args
+RUNSDIR = opts.RUNSDIR
+
+if opts.SCANSAMPLER not in ["uniform", "sobol", "latin"]:
+    print "Error, requested sampling method '%s' not found, exiting"%opts.SCANSAMPLER
+    import sys
+    sys.exit(1)
+
+if not os.path.exists(REFDIR):
+    print "Error, specified data directory '%s' does not exist, exiting\n\n"%REFDIR
+    op.print_usage()
+    sys.exit(1)
+
+if not os.path.exists(opts.OUTDIR):
+    os.makedirs(opts.OUTDIR)
+
+## Load Professor and show the standard banner
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+# Read data files
+DHISTOS = prof.read_all_histos(REFDIR)
+
+## Weight file parsing
+matchers = prof.read_pointmatchers(opts.WFILE) if opts.WFILE else None
+
+
+## Try to read run histos and extract maximum errors --- NOTE this bit might be broken with patches NOTE
+MAXERRDICT = None
+if opts.USE_RUNSDIR:
+    try:
+        _, RUNHISTOS = prof.read_all_rundata(RUNSDIR, None) #< don't care about reading params files
+        MAXERRDICT = prof.find_maxerrs(RUNHISTOS)
+    except:
+        print "Could not read run data for error regularisation -- chi2 may be unstable"
+
+## Slightly messy bit, load each ipol file we get and store everything in a master dictionary
+from collections import OrderedDict
+MASTERBOX=OrderedDict()
+MASTERCENTER=OrderedDict()
+for IFILE in IFILES:
+    box, center, fitdata = prof.prepareBox(IFILE, DHISTOS, matchers, MAXERRDICT, opts.FILTER, opts.DEBUG)
+    if opts.NORMW:
+        totw=sum([x.w for x in fitdata[0][1]])
+        for ibin in fitdata[0][1]:
+            ibin.w/=totw
+    MASTERBOX[box]=dict(fitdata)
+    MASTERCENTER[center]=MASTERBOX[box]
+
+
+## Take parameter names from the first box and assert that all other boxes (if present) have the same names
+PNAMES=MASTERBOX.values()[0]["PNAMES"]
+for v in MASTERBOX.values()[1:]:
+    assert PNAMES == v["PNAMES"]
+
+## Initial conditions --- use pos = center of hypercube, and step = range/10
+pmins, pmaxs, pminmax = [], [], []
+for num, pname in enumerate(PNAMES):
+    testmin = [box[num][0] for box in MASTERBOX.keys()]
+    testmax = [box[num][1] for box in MASTERBOX.keys()]
+    pmins.append(min(testmin))
+    pmaxs.append(max(testmax))
+    pminmax.append([min(testmin), max(testmax)])
+assert len(pmins) == len(pmaxs)
+
+## Function definition wrapper
+# TODO allow user specified fitfunc
+funcdef = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoF", ["MASTERBOX", "MASTERCENTER", "opts.DEBUG"])
+exec funcdef in locals()
+if opts.DEBUG:
+    print "Built GoF wrapper from:\n  '%s'" % funcdef
+
+
+
+
+# Unless we do a scan first, choose the center of param space as startpoint
+pstart = [(pmins[i] + pmaxs[i])/2. for i in xrange(len(pmins))]
+
+# Scan for better start point
+if opts.SCANNP is not None:
+    npoints = opts.SCANNP
+    startSampler= prof.NDSampler(pminmax, sampler=opts.SCANSAMPLER, seed=opts.SCANSEED)
+    startPoints = [startSampler() for _ in xrange(npoints)]
+    print "Scanning %i points" % (npoints)
+    testVals = [profGoF(*x) for x in startPoints]
+    winner = startPoints[testVals.index(min(testVals))]
+
+    ## This sets the start point
+    print "Using startpoint that yieldes fval %e:"%min(testVals)
+    for i, aname in enumerate(PNAMES):
+        pstart[i] = winner[i]
+        print "%s = %f"%(aname, pstart[i])
+
+## Dictionary fitarg for iminuit
+import professor2 as prof
+limits, fixed = prof.read_limitsandfixed(opts.LIMITS)
+FARG=prof.setupMinuitFitarg(PNAMES, pstart, pmins, pmaxs, limits, fixed, opts.EXTRAPOLATE, verbose=True)
+
+
+if not opts.QUIET:
+    print "\n"
+    print 66*"*"
+    print "* Using iminuit, please visit https://github.com/iminuit/iminuit *"
+    print 66*"*"
+    print "\n"
+
+# TODO: errordef as CL params?
+PRINTLEVEL = 0 if opts.QUIET else 1
+
+minuit = Minuit(profGoF, errordef=1, print_level=PRINTLEVEL, forced_parameters=PNAMES, **FARG)
+minuit.strategy = opts.STRATEGY
+
+import time
+start_time = time.time()
+## Lift off
+minuit.migrad()
+if opts.MINOS:
+    minuit.minos()
+print("Minimisation finished after %s seconds" % (time.time() - start_time))
+
+## Now process the result:
+## Goodness of fit
+n_freeparams=len(PNAMES) - len(minuit.list_of_fixed_param())
+chi2 = minuit.fval
+ndof = len(MASTERBOX.values()[0]["DBINS"]) - n_freeparams
+ndof2 = 0
+wdof2 = 0
+for ibin in MASTERBOX.values()[0]["IBINS"]:
+    if ibin.w>0:
+        ndof2+=1
+        wdof2+=ibin.w*ibin.w
+ndof2-=n_freeparams
+wdof2-=n_freeparams
+
+
+# len(MASTERBOX.values()[0]["DBINS"]) - len(PNAMES) - len(minuit.list_of_fixed_param())
+if not opts.QUIET:
+    print "'chi2': %.2f --- Ndfold : %i --- Ndfnew : %i ---Wdf : %.f --- ratioold : %.2f --- rationew : %.2f --- ratioWW : %.2f" % (chi2, ndof, ndof2, wdof2, chi2/ndof, chi2/ndof2, chi2/wdof2)
+
+## Check if result is in validity range
+result = [minuit.values[p] for p in PNAMES]
+rok, rng = prof.is_inrange(result, pmins, pmaxs)
+
+
+if not rok:
+    msg="Warning --- parameters are outside the validity of the parametrisation:"
+    for i in rng:
+        msg+="\n %s=%f ! in [%f,%f]"%(PNAMES[i], result[i], pmins[i], pmaxs[i])
+    msg+= "\n You might want to impose limits (--limits) on those parameters."
+    if not opts.QUIET:
+        print msg
+
+# Get the chi2 value setting all non-zero weights to 1
+
+funcdefunit = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoFunit", ["MASTERBOX", "MASTERCENTER", "opts.DEBUG", "True"])
+exec funcdefunit in locals()
+chi2unit = profGoFunit(*result)
+print("Unbiased chi2: %.2f"%chi2unit)
+
+# Max number of characters in any of parameter names --- for formatting (ljust)
+LMAX=max([len(p) for p in PNAMES])
+
+
+# Get the right box first
+boxdict = prof.getBox(result, MASTERBOX, MASTERCENTER)
+
+
+
+## Write out result
+with open("%s/results.txt" % opts.OUTDIR,"w") as f:
+    ## Meta info
+    f.write("# ProfVersion: %s\n" % prof.version())
+    f.write("# Date: %s\n" % prof.mk_timestamp())
+    if len(IFILES)==1:
+        f.write("# InterpolationFile: %s\n" % os.path.abspath(IFILES[0]))
+    else:
+        s="# InterpolationFiles:"
+        for IFILE in IFILES:
+            s+=" %s"%os.path.abspath(IFILE)
+        f.write("%s\n"%s)
+    f.write("# DataDirectory: %s\n" % os.path.abspath(REFDIR))
+    ## Limits
+    lstring = ""
+    pstate = minuit.get_param_states()
+    for num, p in enumerate(PNAMES):
+        if pstate[num]["has_limits"] and not pstate[num]["is_fixed"]:
+            lstring += "\n#\t%s\t%f %f" % (p.ljust(LMAX), pstate[num]["lower_limit"], pstate[num]["upper_limit"])
+    f.write("#\n# Limits:%s" % lstring)
+    # Fixed parameters
+    fstring = ""
+    for num, p in enumerate(PNAMES):
+        if pstate[num]["is_fixed"]:
+            fstring += "\n#\t%s\t%f" % (p.ljust(LMAX), pstate[num]["value"])
+    f.write("\n#\n# Fixed:%s\n" % fstring)
+    f.write("#\n# Minimisation result:\n#\n")
+    f.write("# GOF %f\n"%chi2)
+    f.write("# UNITGOF %f\n"%chi2unit)
+    f.write("# NDOF %f\n"%ndof)
+    ## The tuned parameter values
+    for i, p in enumerate(PNAMES):
+        f.write("%s\t%f\n" % (p.ljust(LMAX), minuit.values[PNAMES[i]]))
+
+    # The MIGRAD errors
+    f.write("#\n# MIGRAD errors:\n#\n")
+    for i, p in enumerate(PNAMES):
+        f.write("# %s\t%e\n" % (p.ljust(LMAX), minuit.errors[PNAMES[i]]))
+
+    # MINOS stuff if we have it
+    if len(minuit.get_merrors())>0:
+        f.write("#\n# MINOS errors:\n#\n")
+        for i, p in enumerate(PNAMES):
+            temp = sorted([k for k in minuit.merrors.keys() if p == k[0]])
+            minos=[minuit.merrors[k] for k in temp]
+            f.write("# %s\t%e\t%e\n" % (p.ljust(LMAX), minos[0], minos[1]))
+
+    # Correlation matrix --- if params are fixed the covariance is not defined
+    # The keys of minuit.covariance are tuples of strings
+    f.write("#\n# Correlation matrix:\n#\n")
+    t1, t2 = zip(*minuit.covariance.keys())
+    l1=list(t1)
+    CNAMES=list(set(l1))
+
+    from math import sqrt
+    for i in PNAMES:
+        s="# %s"%i.ljust(LMAX)
+        for j in PNAMES:
+            if i in CNAMES and j in CNAMES:
+                if minuit.covariance[(i,j)] >=0:
+                    s+= "    %e"%(minuit.covariance[(i,j)]/sqrt(minuit.covariance[(i,i)]*minuit.covariance[(j,j)]))
+                else:
+                    s+= "   %e"%( minuit.covariance[(i,j)]/sqrt(minuit.covariance[(i,i)]*minuit.covariance[(j,j)]))
+            else:
+                s+= "    ---"
+        f.write(s+"\n")
+    f.write("#\n# Covariance matrix:\n#\n")
+    for i in PNAMES:
+        s="# %s"%i.ljust(LMAX)
+        for j in PNAMES:
+            if i in CNAMES and j in CNAMES:
+                if minuit.covariance[(i,j)] >=0:
+                    s+= "    %e"%minuit.covariance[(i,j)]
+                else:
+                    s+= "   %e"%minuit.covariance[(i,j)]
+            else:
+                s+= "    ---"
+        f.write(s+"\n")
+
+    # Weights ---  dump them all at the end
+    f.write("#\n#\n# Weights used\n#\n")
+
+    if matchers is None:
+        for k in boxdict["IHISTOS"].keys():
+            f.write("# %s\t1.0\n"%k)
+    else:
+        with open(opts.WFILE) as g:
+            for line in g:
+                l=line.strip()
+                if len(l)==0 or l.startswith("#"):
+                    continue
+                f.write("# %s\n"%l)
+
+    # Get the observables that actually entered the chi2
+    f.write("#\n# Mean contribution:\n#\n")
+    actual_obs = [k for k, v in boxdict["BINDICES"].items() if len(v)>0]
+    for ao in actual_obs:
+        tempf = dict(prof.boxFilt(boxdict, [ao]))
+        tempb = { tempf["BOX"] : tempf}
+        tempc = { tempf["CENTER"] : tempf}
+        funcdefunit = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoFunit", ["tempf", "tempc", "opts.DEBUG", "True"])
+        exec funcdefunit in locals()
+        nbins_obs = len(boxdict["BINDICES"][ao])
+        chi2obs = profGoFunit(*result)
+        f.write("# %s\t%f\n"%(ao, chi2obs/nbins_obs))
+
+# Minimiser profiles
+if opts.PROFILES:
+    try:
+        import pylab
+        print "Drawing profiles"
+        for num1, p1 in enumerate(PNAMES):
+            pylab.clf()
+            minuit.draw_profile(p1,subtract_min=True)
+            pylab.savefig(os.path.join(opts.OUTDIR, "profile_%s.pdf"%p1))
+            pylab.clf()
+            minuit.draw_mnprofile(p1,subtract_min=True)
+            pylab.savefig(os.path.join(opts.OUTDIR, "mnprofile_%s.pdf"%p1))
+    except Exception, e:
+        print "Could not draw profiles:"
+        print e
+# Minimiser contours
+if opts.CONTOURS:
+    try:
+        import pylab
+        print "Drawing contours"
+        pylab.clf()
+        for num1, p1 in enumerate(PNAMES):
+            for num2, p2 in enumerate(PNAMES):
+                if num2 < num1:
+                    pylab.clf()
+                    try:
+                        minuit.draw_contour(p1,p2)
+                        pylab.savefig(os.path.join(opts.OUTDIR, "contour_%s_%s.pdf"%(p1,p2)))
+                    except:
+                        print "Could not draw contour for %s vs. %s"%(p1,p2)
+                        pass
+                    pylab.clf()
+                    try:
+                        minuit.draw_mncontour(p1,p2)
+                        pylab.savefig(os.path.join(opts.OUTDIR, "mncontour_%s_%s.pdf"%(p1,p2)))
+                    except:
+                        print "Could not draw mncontour for %s vs. %s"%(p1,p2)
+                        pass
+    except Exception, e:
+        print "Could not draw contours:"
+        print e
+
+## Write out ipolhistos
+try:
+    import yoda
+
+    IHISTOS=boxdict["IHISTOS"]
+    scatters=[IHISTOS[k].toDataHisto(result).toScatter2D() for k in sorted(IHISTOS.keys())]
+    yoda.writeYODA(scatters, "%s/ipolhistos.yoda" % opts.OUTDIR)
+except ImportError:
+    print "Unable to import yoda, not writing out ipolhistos"
+
+print "Done. All output written to %s"%opts.OUTDIR

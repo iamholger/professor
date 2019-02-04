@@ -1,0 +1,61 @@
+#!/usr/bin/env python
+
+"""\
+%prog [-o outdir] INPUTDIR
+
+Make 1D distribution and 2D scatter plots of output of prof2-sample.
+"""
+
+import optparse
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-o", "--outdir", dest="OUTDIR", default="plotscan", help="specify the output directory name (default: %default)")
+op.add_option("-p", "--pfile", dest="PARAMSFILE", metavar="FILE", default="params.dat", help="specify params file base name to be populated for each sample point")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+opts, args = op.parse_args()
+from numpy import loadtxt
+import os, sys
+
+def readParams(fname):
+    ret={}
+    with open(fname) as f:
+        for l in f:
+            k, v = l.split()
+            ret[k] = float(v)
+    return ret
+DIRS = [os.path.join(args[0], x) for x in os.listdir(args[0])]
+
+P = [readParams(os.path.join(d, opts.PARAMSFILE)) for d in DIRS]
+
+if len(P) == 0:
+    print("No files '%s' found in directory '%s'. Please check CL option -p")
+    sys.exit(1)
+
+params = sorted( P[0].keys() )
+
+
+if not os.path.exists(opts.OUTDIR):
+    os.makedirs(opts.OUTDIR)
+
+import pylab
+for num, p in enumerate(params):
+    v_ = [x[p] for x in P]
+    F=pylab.figure()
+    ax = F.add_subplot(1,1,1,)
+    ax.hist(v_, 30, stacked=True, fill=True , color="r")
+    pylab.xlabel(p)
+    F.savefig("%s/dist_param_%i_%s.pdf"%(opts.OUTDIR, num, p))
+    F.clf()
+    for num2, p2 in enumerate(params):
+        if (num<num2):
+            v2_ = [x[p2] for x in P]
+            F=pylab.figure()
+            s=F.add_subplot(111)
+            s.plot(v_, v2_, 'r.')
+            s.set_xlabel(p)
+            s.set_ylabel(p2)
+
+            F.savefig("%s/scatter_param_%i_%i_%s_%s.pdf"%(opts.OUTDIR,num,num2,p, p2))
+            F.clf()
+
+print("Output written to '%s'. You might want to create an html page using 'cd %s && makegallery.py pdf -c%i plots.html'"%(opts.OUTDIR, opts.OUTDIR, len(params)))

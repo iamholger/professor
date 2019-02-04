@@ -1,0 +1,237 @@
+#! /usr/bin/env python
+
+"""\
+%prog -d <refdir> [<ipolfiles>=ipol.dat ...] [opts]
+
+Use the interpolations stored in <ipolfiles> to perform likelihood
+scan with pymultinest. The loglikelihood is -0.5*profChi2.
+
+The best fit point of the multinest run is used to calculate
+and write out histograms.
+
+"""
+
+
+def pBoxDistance(A, B):
+    import math
+    return math.sqrt(sum([ (A[i]-B[i])*(A[i]-B[i]) for i in xrange(len(A))]))
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-d", "--datadir", dest="DATADIR", default=None, help="The data directory")
+op.add_option("-o", "--outdir", dest="OUTDIR", default="tunes", help="Prefix for outputs (default: %default)")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file to specify unequal chi2 weights of each bin in the fit (default: %default)")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--nest-points", dest="POINTS", default=1000, type=int, help="Number of live points in PyMultinest")
+op.add_option("--nest-tol", dest="TOL", default=0.1, type=float, help="Evidence tolerance")
+op.add_option("--nest-eff", dest="EFF", default=0.8, type=float, help="Sampling efficiency")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="Turn off messages")
+op.add_option("-r", "--runsdir", dest="RUNSDIR", default=None, help="The runs directory")
+op.add_option("--limit-errs", dest="USE_RUNSDIR", action="store_true", default=False, help="Re-read the runsdir to regularise error ipols")
+op.add_option("--filter", dest="FILTER", action="store_true", default=False, help="Filter out data bins that have 0 error")
+op.add_option("--nest-resume", dest="RESUME", default=False, action='store_true', help="Resume on previous run.")
+op.add_option("--nest-update", dest="UPDATE", default=1000, type=int, help="Update inteval (default: %default iterations)")
+opts, args = op.parse_args()
+
+try:
+    import pymultinest
+except ImportError:
+    print "Multinest not found, exiting\n"
+    print "Try: pip install multinest --user"
+    sys.exit(1)
+## Get mandatory arguments
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+REFDIR = opts.DATADIR
+if REFDIR is None:
+    print "Error, no data directory specified (-d/--datadir), exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+IFILES = args
+RUNSDIR = opts.RUNSDIR
+
+
+if not os.path.exists(REFDIR):
+    print "Error, specified data directory '%s' does not exist, exiting\n\n"%REFDIR
+    op.print_usage()
+    sys.exit(1)
+
+
+## Load Professor and show the standard banner
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+# Read data files
+DHISTOS = prof.read_all_histos(REFDIR)
+
+## Weight file parsing
+matchers = prof.read_pointmatchers(opts.WFILE) if opts.WFILE else None
+
+
+## Try to read run histos and extract maximum errors --- NOTE this bit might be broken with patches NOTE
+MAXERRDICT = None
+if opts.USE_RUNSDIR:
+    try:
+        _, RUNHISTOS = prof.read_all_rundata(RUNSDIR, None) #< don't care about reading params files
+        MAXERRDICT = prof.find_maxerrs(RUNHISTOS)
+    except:
+        print "Could not read run data for error regularisation -- chi2 may be unstable"
+
+## Slightly messy bit, load each ipol file we get and store everything in a master dictionary
+from collections import OrderedDict
+MASTERBOX=OrderedDict()
+MASTERCENTER=OrderedDict()
+for IFILE in IFILES:
+    box, center, fitdata = prof.prepareBox(IFILE, DHISTOS, matchers, MAXERRDICT, opts.FILTER, opts.DEBUG)
+    MASTERBOX[box]=dict(fitdata)
+    MASTERCENTER[center]=MASTERBOX[box]
+
+## Take parameter names from the first box and assert that all other boxes (if present) have the same names
+PNAMES=MASTERBOX.values()[0]["PNAMES"]
+for v in MASTERBOX.values()[1:]:
+    assert PNAMES == v["PNAMES"]
+
+
+## Function definition wrapper
+funcdef = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoF", ["MASTERBOX", "MASTERCENTER", "opts.DEBUG"])
+exec funcdef in locals()
+if opts.DEBUG:
+    print "Built GoF wrapper from:\n  '%s'" % funcdef
+
+if not opts.QUIET:
+    print "\n"
+    print 78*"*"
+    print "* Using pymultinest, please cite https://doi.org/10.1051/0004-6361/201322971 *"
+    print 78*"*"
+    print "\n"
+
+
+## Determine the box for the sampler
+
+pmins, pmaxs = [], []
+for num, pname in enumerate(PNAMES):
+    testmin = [box[num][0] for box in MASTERBOX.keys()]
+    testmax = [box[num][1] for box in MASTERBOX.keys()]
+    pmins.append(min(testmin))
+    pmaxs.append(max(testmax))
+assert len(pmins) == len(pmaxs)
+
+
+
+
+## Fix parameters, set limits (with pname translation)
+limits, fixed = prof.read_limitsandfixed(opts.LIMITS)
+
+if len(limits)>0:
+    for num, pname in enumerate(PNAMES):
+        if pname in limits.keys():
+            pmins[num] = limits[pname][0]
+            pmaxs[num] = limits[pname][1]
+
+if len(fixed)>0:
+    active = [x for x in PNAMES if not x in fixed.keys()]
+    remove = [PNAMES.index(x) for x in fixed.keys()]
+    pmins = [x for num, x in enumerate(pmins) if not num in remove]
+    pmaxs = [x for num, x in enumerate(pmaxs) if not num in remove]
+else:
+    active=PNAMES
+
+
+
+plength = [(pmaxs[i] - pmins[i]) for i in xrange(len(pmins))]
+
+
+NP = len(pmins)
+
+
+def scaleParam(p, idx):
+    return pmins[idx] + p * plength[idx]
+
+def myprior(cube, ndim, nparams):
+    for i in range(ndim):
+        cube[i] = scaleParam(cube[i], i)
+
+from math import exp, log
+from collections import OrderedDict
+def loglike(cube, ndim, nparams):
+    PP=OrderedDict.fromkeys(PNAMES)
+    for num, pname in enumerate(active):
+        PP[pname] = cube[num]
+    for k, v in fixed.iteritems():
+        PP[k]=v
+    loli = -0.5*profGoF(*PP.values())
+    return loli
+
+import matplotlib, os, sys
+matplotlib.use(os.environ.get("MPL_BACKEND", "Agg"))
+import pymultinest
+
+# A bit of a hack to compactly have the script work with and without mpi
+rank = 0
+try:
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    size = comm.Get_size()
+    rank = comm.Get_rank()
+except:
+    pass
+
+# Create output directory
+if rank==0:
+    if not os.path.exists(opts.OUTDIR):
+        os.makedirs(opts.OUTDIR)
+    import time
+    start_time = time.time()
+
+# Run MultiNest
+pymultinest.run(loglike, myprior, NP, importance_nested_sampling = True, verbose = True,
+        multimodal=True, resume=opts.RESUME, n_iter_before_update=opts.UPDATE,
+        evidence_tolerance=opts.TOL, sampling_efficiency = opts.EFF,
+        n_live_points = opts.POINTS,
+        outputfiles_basename='%s/PROFNEST'%opts.OUTDIR)
+
+
+
+if rank==0:
+    print("\nMultinest finished after %s seconds\n" % (time.time() - start_time))
+    print("Now analyzing output")
+    a = pymultinest.Analyzer(n_params = NP, outputfiles_basename='%s/PROFNEST'%opts.OUTDIR)
+    s = a.get_stats()
+
+    import json
+    # store name of parameters, always useful
+    with open('%sparams.json' % a.outputfiles_basename, 'w') as f:
+            json.dump(PNAMES, f, indent=2)
+    with open('%sparams.info' % a.outputfiles_basename, 'w') as f:
+        for p in PNAMES:
+            f.write("%s\n"%p)
+    # store derived stats
+    with open('%sstats.json' % a.outputfiles_basename, mode='w') as f:
+            json.dump(s, f, indent=2)
+
+    # print("Global Evidence:\n\t%.15e +- %.15e" % ( s['nested sampling global log-evidence'], s['nested sampling global log-evidence error'] ))
+
+
+    ## Write out ipolhistos
+    try:
+        import yoda
+        resraw = a.get_best_fit()["parameters"]
+        PP=OrderedDict.fromkeys(PNAMES)
+        for num, pname in enumerate(active):
+            PP[pname] = resraw[num]
+        for k, v in fixed.iteritems():
+            PP[k]=v
+        result = PP.values()
+
+        boxdict = prof.getBox(result, MASTERBOX, MASTERCENTER)
+        IHISTOS=boxdict["IHISTOS"]
+        scatters=[IHISTOS[k].toDataHisto(result).toScatter2D() for k in sorted(IHISTOS.keys())]
+        yoda.writeYODA(scatters, "%s/nest_ipolhistos.yoda" % opts.OUTDIR)
+    except ImportError:
+        print "Unable to import yoda, not writing out ipolhistos"
+    print("Done! Output written to %s"%opts.OUTDIR)
+    print("You may wish to analyse the output with superplot --- https://arxiv.org/abs/1603.00555")

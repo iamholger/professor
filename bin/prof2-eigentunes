@@ -1,0 +1,254 @@
+#! /usr/bin/env python
+
+"""\
+%prog -d <datadir> -m <resultsfile> [ipolfile(s)] [opts]
+
+Read in a minimisation result, datadir and ipolfile(s) to
+construct eigentunes.
+
+TODO:
+ * Replace manual target with something clever
+"""
+
+def mkEigenTunes(T_trans, point, fixed, GOFdef, target, plus=True):
+    """
+    COV   ... real symmetric covariance matrix
+    point ... could be any point in the true parameter space but should be
+              the minimisation result i.e. the center of COV
+    """
+    import numpy as np
+
+    rv = np.matrix([v for k, v in point.iteritems() if not k in fixed.keys()]).transpose()
+
+    ret = []
+
+    # Construct all base vectors (in rotated system) with pos and neg directions
+    dim = len(point.values()) - len(fixed.values())
+    EVS = []
+    for i in xrange(dim):
+        ev = np.zeros(dim) # A zero vector in len(S) dimensions
+        # Set one of the coordinates to 1 or -1
+        ev[i] = 1 if plus else -1
+        EVS.append(np.array(T_trans*np.matrix(ev).transpose()))
+
+
+    # Get the eigentunes
+    for num, ev in enumerate(EVS):
+        thisEigentune  =  ETSolve(rv, ev, T_trans, GOFdef, target)
+        ret.append([(num+1) if plus else -(num+1), thisEigentune])
+
+    return ret
+
+def ETSolve(center, direction_t, TRAFO, GOFdef, target):
+    exec GOFdef in globals() # Note globals!
+
+    def getVal(a):
+        temp = center +  a*direction_t
+        locval = profGoF(*temp) - target
+        return locval
+
+    def getP(a):
+        temp = center +  a*direction_t
+        return temp
+
+    from scipy.optimize import fsolve
+    x = fsolve(getVal,0.1)
+    return np.array(getP(x)).ravel()
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-d", "--datadir", dest="DATADIR", default=None, help="The data directory")
+op.add_option("-m", "--minres", dest="RESULT",  default=None, help="Minimisation result to use for eigentunes calculation")
+op.add_option("-o", "--outdir", dest="OUTDIR", default="valley", help="Output directory")
+op.add_option("-r", "--runsdir", dest="RUNSDIR", default=None, help="The runs directory")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict ipol building to a subset of bins (default: %default)")
+op.add_option("--limit-errs", dest="USE_RUNSDIR", action="store_true", default=False, help="Re-read the runsdir to regularise error ipols")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--filter", dest="FILTER", action="store_true", default=False, help="Filter out data bins that have 0 error")
+op.add_option("--target", dest="TARGET", type=float, default=2, help="Target factor for delta chi2")
+op.add_option("--kernel", dest="KERNELCOV", action="store_true", default=False, help="Estimate covariance matrix using emcee")
+op.add_option("--kernel-np", dest="KERNELCOVNP", type=int, default=1000, help="Number of emcee points to generate (default: %default)")
+opts, args = op.parse_args()
+
+## Get mandatory arguments, same as prof2-tune
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+REFDIR = opts.DATADIR
+if REFDIR is None:
+    print "Error, no data directory specified (-d/--datadir), exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+IFILES = args
+RUNSDIR = opts.RUNSDIR
+
+# Sanity
+if not os.path.exists(REFDIR):
+    print "Error, specified data directory '%s' does not exist, exiting\n\n"%REFDIR
+    op.print_usage()
+    sys.exit(1)
+if not os.path.exists(opts.OUTDIR):
+    os.makedirs(opts.OUTDIR)
+
+if opts.RESULT is None:
+    print "Error, no result file given"
+    sys.exit(1)
+
+## Load Professor and show the standard banner
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+# Read data files
+DHISTOS = prof.read_all_histos(REFDIR)
+
+from collections import OrderedDict
+MASTERBOX=OrderedDict()
+MASTERCENTER=OrderedDict()
+
+## Weight file parsing --- by default read from results file
+matchers = prof.read_pointmatchers(opts.WFILE) if opts.WFILE else prof.read_pointmatchersfromresults(opts.RESULT)
+
+## Try to read run histos and extract maximum errors --- NOTE this bit might be broken with patches NOTE
+MAXERRDICT = None
+if opts.USE_RUNSDIR:
+    try:
+        _, RUNHISTOS = prof.read_all_rundata(RUNSDIR, None) #< don't care about reading params files
+        MAXERRDICT = prof.find_maxerrs(RUNHISTOS)
+    except:
+        print "Could not read run data for error regularisation -- chi2 may be unstable"
+
+for IFILE in IFILES:
+    box, center, fitdata = prof.prepareBox(IFILE, DHISTOS, matchers, MAXERRDICT, opts.FILTER, opts.DEBUG)
+    MASTERBOX[box]=dict(fitdata)
+    MASTERCENTER[center]=MASTERBOX[box]
+
+## Take parameter names from the first box and assert that all other boxes (if present) have the same names
+PNAMES=MASTERBOX.values()[0]["PNAMES"]
+for v in MASTERBOX.values()[1:]:
+    assert PNAMES == v["PNAMES"]
+
+
+# Central tuning result's GOF, min/max paramvalues
+P_min, OTH = prof.readResult(opts.RESULT)
+GOF_min = [float(x.split()[-1]) for x in OTH if "GOF" in x][0]
+gof_target = opts.TARGET+GOF_min
+
+
+pmins, pmaxs = [], []
+for num, pname in enumerate(PNAMES):
+    testmin = [box[num][0] for box in MASTERBOX.keys()]
+    testmax = [box[num][1] for box in MASTERBOX.keys()]
+    pmins.append(min(testmin))
+    pmaxs.append(max(testmax))
+IBOX=zip(pmins,pmaxs) # This is required for the boundaries of emcee sampling
+
+
+# Fixed Parameters
+fixed=prof.getFixedParams(OTH)
+
+
+
+funcdef = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoF", ["MASTERBOX", "MASTERCENTER", "opts.DEBUG"])
+exec funcdef in locals()
+if not opts.QUIET:
+    print "Info: GOF minimum from file as:",GOF_min
+    print "Info: This should be reasonably close to GOF evaluated at minimum:", profGoF(*P_min.values())
+assert(abs(GOF_min - profGoF(*P_min.values()))<1e-2)
+if not opts.QUIET:
+    print "Info: Target GOF for eigntunes is:", gof_target
+
+if opts.KERNELCOV:
+    if not opts.QUIET:
+        print "Running emcee sampler"
+    import numpy as np
+    try:
+        import emcee
+    except ImportError:
+        raise Exception("Cannot use emcee, try pip install emcee")
+    def loglike(PP):
+        if not prof.pInBOX(PP, IBOX):
+            return -np.inf
+        likelihood = -0.5*profGoF(*PP)
+        return likelihood
+    ndim, nwalkers = len(PNAMES), 100
+    p0 = [np.array([np.random.uniform(p[0],p[1]) for p in IBOX]) for i in range(nwalkers)]
+    sampler = emcee.EnsembleSampler(nwalkers, ndim, loglike, args=[])
+    pos, prob, state =  sampler.run_mcmc(p0, opts.KERNELCOVNP)
+    import matplotlib.pyplot as pl
+    for i in range(ndim):
+        pl.clf()
+        pl.figure()
+        pl.hist(sampler.flatchain[:,i], 100, color="k", histtype="step")
+        pl.title(PNAMES[i])
+        pl.savefig(os.path.join(opts.OUTDIR, "emcee_%i_%s.pdf"%(i, PNAMES[i])))
+
+    if not opts.QUIET:
+        print "Mean acceptance fraction: {0:.3f}".format(np.mean(sampler.acceptance_fraction))
+
+    # Kernel density estimator
+    try:
+        from scipy import stats
+    except ImportError:
+        raise Exception("Cannot use scipy stats for kernel estimation, try pip install scipy")
+    kernel = stats.gaussian_kde(pos.T)
+    C_kernel=kernel.covariance
+    if not opts.QUIET:
+        print "Using kernel covariance"
+    T_fwd, S, T_back = prof.eigenDecomposition(C_kernel) # S is vector, not a diagonal matrix
+else:
+    # Parameter covariance from result
+    C_param = prof.getParamCov(OTH) # That's the minimiser covariance
+    T_fwd, S, T_back = prof.eigenDecomposition(C_param) # Eigen decomposition
+
+import numpy as np
+
+# TODO make the whole thing work with fixed parameters, too
+# Calculate the eigen tunes (points in parameter space)
+E_plus  = mkEigenTunes(T_fwd, P_min, {}, funcdef, gof_target)
+E_minus = mkEigenTunes(T_fwd, P_min, {}, funcdef, gof_target, plus=False)
+ETs = dict(E_plus+E_minus)
+
+# Print/save eigentunes
+etable = prof.mkEigenTable(ETs, opts.RESULT)
+if not opts.QUIET:
+    print etable
+etableoutfname="%s/Eigentunes_%s.params"%(opts.OUTDIR, str(opts.TARGET))
+with open(etableoutfname, "w") as f:
+    f.write(etable)
+if not opts.QUIET:
+    print "Stored Eigentune parameters in file %s"%etableoutfname
+
+try:
+    import yoda
+except ImportError:
+    print "Cannot find yoda, not writing output histograms"
+    sys.exit(1)
+
+# Get the corresponding ipol histos
+EThists = {}
+for k, ET in ETs.iteritems():
+    thisEThists = prof.mkScatters(MASTERBOX, MASTERCENTER, ET)
+    sgn = "+" if k > 0 else "-"
+    yoda.writeYODA(thisEThists, "%s/Eigentunes_%.1f_%i%s.yoda" % (opts.OUTDIR,opts.TARGET, int(abs(k)), sgn))
+    EThists[k]=thisEThists
+
+# And for convenience corresponding envelopes
+H_min = prof.mkScatters(MASTERBOX, MASTERCENTER, P_min)
+envelopes = prof.mkEnvelopes(H_min, EThists)
+for k, v in envelopes.iteritems():
+    yoda.writeYODA(v, "%s/EigentunesComb_%.1f_%i.yoda" % (opts.OUTDIR,opts.TARGET, k))
+
+# This is the envelope of the eigentunes
+totvelopes = prof.mkTotvelopes(H_min, EThists)
+# This is the deltas added in quadrature
+quadvelopes = prof.mkAddvelopes(H_min, EThists)
+# This is the deltas added linearly
+linvelopes = prof.mkAddvelopes(H_min, EThists, addLinear=True)
+
+yoda.writeYODA(totvelopes,  "%s/Totvelopes_%.1f.yoda"%(opts.OUTDIR,opts.TARGET))
+yoda.writeYODA(quadvelopes, "%s/Quadvelopes_%.1f.yoda"%(opts.OUTDIR,opts.TARGET))
+yoda.writeYODA(linvelopes,  "%s/Linvelopes_%.1f.yoda"%(opts.OUTDIR,opts.TARGET))

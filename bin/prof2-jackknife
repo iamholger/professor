@@ -1,0 +1,362 @@
+#! /usr/bin/env python
+
+"""\
+%prog <runsdir> [<ipolfile>=ipol.dat] [opts]
+
+Compute and plot the relative deviations of the given interpolation from the
+corresponding sample points in the given <runsdir>, for both bin values and bin
+errors. Histograms are made for each histogram independently (summed over bins and MC
+points), and for the sum over all histos and bins, and are written to PDFs and
+to a res.yoda data file.
+
+This can be useful for determining whether the interpolation is providing a
+sufficiently faithful approximation to the true observables, and choosing the
+most appropriate order of fit polynomial. It can also be useful to detect
+overfitting, by comparing residuals distributions between the set of runs used
+to make the fit (via prof-ipol) and an equivalent set not included in the fit.
+
+TODO:
+ * Allow control over the output filenames / directory.
+ * Add an option for value-only (no err) residuals
+ * Support runcomb filtering
+"""
+
+
+from __future__ import print_function
+
+import matplotlib, os
+matplotlib.use(os.environ.get("MPL_BACKEND", "Agg"))
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+#op.add_option("--ifile", dest="IFILE", default="ipol.dat", help="file from which to read the bin interpolations (default: %default)")
+op.add_option("--pname", "--pfile", dest="PNAME", default="params.dat", help="name of the params file to be found in each run directory (default: %default)")
+op.add_option("-j", dest="MULTI", type=int, default=1, help="Number of threads to use")
+op.add_option("--summ",  dest="SUMMARY", default=None, help="Summary description to be written to the ipol output file")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict ipol building to a subset of bins (default: %default)")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--no-plots", dest="NO_PLOTS", action="store_true", default=False, help="don't write histogram PDFs (default: %default)")
+op.add_option("--tot-only", dest="ONLY_TOT", action="store_true", default=False, help="only make total residuals histograms, not per-observable (default: %default)")
+op.add_option("--logx", dest="LOG_BINS", action="store_true", default=False, help="use a symmetric log binning for better resolution around 0 (default: %default)")
+op.add_option("--log", dest="LOG", action="store_true", default=False, help="Compare with log values")
+op.add_option("-o", dest="OUTDIR",  default=".", help="Plot output folder")
+op.add_option("-p", dest="PREFIX",  default="jackknife", help="Prefix for Ipol file storage")
+op.add_option("-d", dest="DROPOUT",  type=int,default=10, help="Number of drop-out points")
+op.add_option("-n", dest="NITERATIONS", type=int,  default=1, help="Number of iterations")
+op.add_option("-m", dest="MINORDER",  type=int, default=1, help="Lowest order of polynomials to consider")
+op.add_option("-M", dest="MAXORDER",  default=100, type=int, help="Maximal order to consider")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+opts, args = op.parse_args()
+
+## Get mandatory arguments
+if len(args) < 1:
+    print("Argument missing... exiting\n\n", file=sys.stderr)
+    op.print_usage()
+    sys.exit(1)
+RUNSDIR = args[0]
+
+
+## Load the Professor machinery
+import professor2 as prof
+if not opts.QUIET:
+    print(prof.logo)
+
+## No point in going further if YODA isn't available, too
+try:
+    import yoda
+except ImportError:
+    print("YODA is required by this tool... exiting", file=sys.stderr)
+    sys.exit(1)
+
+
+
+## Load MC run histos and params
+# TODO: add runcomb file parsing to select a runs subset
+try:
+    PARAMS, HISTOS = prof.read_all_rundata(RUNSDIR, opts.PNAME)
+    RUNS, PARAMNAMES, PARAMSLIST = prof.mk_ipolinputs(PARAMS)
+except Exception, e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
+
+
+## Weight file parsing to select a histos subset
+if opts.WFILE:
+    matchers = prof.read_pointmatchers(opts.WFILE)
+    for hn in HISTOS.keys():
+        if not any(m.match_path(hn) for m in matchers.keys()):
+            del HISTOS[hn]
+        elif opts.DEBUG:
+            print ("Observable %s passed weight file path filter" % hn)
+    print ("Filtered observables by path, %d remaining" % len(HISTOS))
+HNAMES = HISTOS.keys()
+
+## If there's nothing left to interpolate, exit!
+if not HNAMES:
+    print ("No observables remaining... exiting")
+    sys.exit(1)
+
+## Robustness tests and cleaning: only retain runs that contain every histo
+bad, badnum = [], []
+for irun, run in enumerate(RUNS):
+    for hn in HNAMES:
+        if not HISTOS[hn].has_key(run):
+            bad.append(run)
+            badnum.append(irun)
+            break
+if opts.LIMITS != None:
+    limits, fixed = prof.read_limitsandfixed(opts.LIMITS)
+    for irun, run in enumerate(RUNS):
+        for inam, nam in enumerate(PARAMNAMES):
+            if PARAMSLIST[irun][inam] <= limits[nam][0] or PARAMSLIST[irun][inam] >= limits[nam][1]:
+                if not run in bad:
+                    bad.append(run)
+                    badnum.append(irun)
+                break
+if bad:
+    print ("Found %d bad runs in %d total... removing" % (len(bad), len(RUNS)))
+    goodr, goodp = [], []
+    for irun, run in enumerate(RUNS):
+        if not irun in badnum:
+            goodr.append(run)
+            goodp.append(PARAMSLIST[irun])
+    RUNS = goodr
+    PARAMSLIST = goodp
+
+## If there's nothing left to interpolate, exit!
+if not RUNS:
+    print ("No valid runs remaining... exiting")
+    sys.exit(1)
+
+# # Testing
+# RUNS=[1 for i in xrange(500)]
+# PARAMNAMES=[i for i in xrange(2)]
+
+# Dimension of the parameter space
+DIM=len(PARAMNAMES)
+
+# The jackknifed number of runs --- determine all possible orders
+JACKNUM = len(RUNS) - opts.DROPOUT
+ORDERS=[]
+
+o_temp=opts.MINORDER
+while True:
+    n_temp = prof.numCoeffs(DIM, o_temp)
+    if n_temp > JACKNUM or o_temp > opts.MAXORDER:
+        break
+    ORDERS.append(o_temp)
+    o_temp+=1
+
+def mkIpolFilename(iteration, order):
+    iname=opts.PREFIX+"_I_%i_O_%i.dat"%(iteration, order)
+    return iname
+
+
+
+def mkIpols(RUNS, PARAMSLIST, ORDER, IFILE):
+
+    IHISTOS = {}
+
+    import zlib
+
+    def worker(q, rdict):
+        "Function to make bin ipols and store ipol persistency strings for each histo"
+        while True:
+            if q.empty():
+                break
+            hn = q.get()
+            histos = HISTOS[hn]
+            ih = prof.mk_ipolhisto(histos, RUNS, PARAMSLIST, ORDER, "none", None)
+            if ih is None:
+                print ("Ignoring", hn)
+            else:
+                s = ""
+                for i, ib in enumerate(ih.bins):
+                    s += "%s#%d %.5e %.5e\n" % (hn, i, ib.xmin, ib.xmax)
+                    s += "  " + ib.ival.toString("val") + "\n"
+                    if ib.ierrs:
+                        s += "  " + ib.ierrs.toString("err") + "\n"
+                rdict[hn] = zlib.compress(s, 9) #< save some memory
+                del s
+            del ih #< pro-actively clear up memory
+            del histos
+
+
+    print ("\n\nParametrising...\n")
+    import time, multiprocessing
+    time1 = time.time()
+
+    ## A shared memory object is required for coefficient retrieval
+    from multiprocessing import Manager
+    manager = Manager()
+    tempDict = manager.dict()
+
+    ## The job queue
+    q = multiprocessing.Queue()
+    map(lambda x:q.put(x), HNAMES)
+
+    ## Fire away
+    workers = [multiprocessing.Process(target=worker, args=(q, tempDict)) for i in range(opts.MULTI)]
+    map(lambda x:x.start(), workers)
+    map(lambda x:x.join(),  workers)
+
+    ## Finally copy the result dictionary into the object itself
+    for k in tempDict.keys():
+        IHISTOS[k] = tempDict[k]
+
+    ## Timing
+    time2 = time.time()
+    print ('Parametrisation took %0.2f s' % ((time2-time1)))
+
+
+    ## Write out meta info
+    # TODO: Move the format writing into the prof2 Python library
+    with open(IFILE, "w") as f:
+        if opts.SUMMARY is not None:
+            f.write("Summary: %s\n" % opts.SUMMARY)
+        #f.write("DataDir: %s\n" % os.path.abspath(RUNSDIR))
+        f.write("ProfVersion: %s\n" % prof.version())
+        f.write("Date: %s\n" % prof.mk_timestamp())
+        f.write("DataFormat: binned 2\n") # This tells the reader how to treat the coefficients that follow
+        # Format and write out parameter names
+        pstring = "ParamNames:"
+        for p in PARAMNAMES:
+            pstring += " %s" % p
+        f.write(pstring + "\n")
+        # Dimension (consistency check)
+        f.write("Dimension: %i\n" % len(PARAMNAMES))
+        # Interpolation validity (hypercube edges)
+        minstring = "MinParamVals:"
+        for v in prof.mk_minvals(PARAMSLIST):
+            minstring += " %f" % v
+        f.write(minstring + "\n")
+        maxstring = "MaxParamVals:"
+        for v in prof.mk_maxvals(PARAMSLIST):
+            maxstring += " %f" % v
+        f.write(maxstring + "\n")
+        f.write("DoParamScaling: 1\n")
+        # Number of inputs per bin
+        f.write("NumInputs: %i\n" % len(PARAMSLIST))
+        s_runs = "Runs:"
+        for r in RUNS:
+            s_runs +=" %s"%r
+        f.write("%s\n"%s_runs)
+        f.write("---\n")
+
+    ## Write out numerical data for all interpolations
+    s = ""
+    for hname in sorted(IHISTOS.keys()):
+        ih = IHISTOS[hname]
+        s += zlib.decompress(ih)
+
+    # Open file for write/append
+    with open(IFILE, "a") as f:
+        f.write(s)
+    print ("\nOutput written to %s" % IFILE)
+
+
+
+
+
+
+
+def preparePulls(runs, params, it, order):
+    from numpy import zeros, ones, mean, std, square, sqrt
+    IFILE=mkIpolFilename(it, order)
+    if not os.path.exists(IFILE):
+        mkIpols(runs, params, o, IFILE)
+
+    IHISTOS, IMETA = prof.read_ipoldata(IFILE)
+    print("Loaded ipol histos from", IFILE)
+    USEDRUNS=IMETA["Runs"].split()
+    KNIFERUNS=[r for r in RUNS if not r in USEDRUNS]
+
+    PULL = {}
+    for hn in sorted(HNAMES):
+    # for hn in sorted(IHISTOS.keys()):
+        IH = IHISTOS[hn]
+        nbins= IH.nbins
+        pull = 20*ones((len(KNIFERUNS),nbins))
+        for num, run in enumerate(KNIFERUNS):
+            P = PARAMS[run]
+            temp = IH.toDataHisto(P)
+            for i in xrange(nbins):
+                mcval = HISTOS[hn][run].bins[i].val
+                ipval = temp.bins[i].val
+                # if ipval<0:
+                    # ipval=1e20
+                # if mcval>0:
+                pull[num][i] = (ipval - mcval)/ipval
+                # else:
+                    # pull[num][i] = 0
+        PULL[hn]= pull
+    return PULL
+
+
+xc = [r for r in prof.sampling.xrandomUniqueCombinations(RUNS, len(RUNS)-opts.DROPOUT, opts.NITERATIONS)]
+
+ALL ={}
+import numpy
+for IT in xrange(opts.NITERATIONS):
+    thisRC=xc[IT]
+    # Filtering
+    thisRUNS, thisPARAMSLIST = [], []
+    for num, r in enumerate(RUNS):
+        if r in thisRC:
+            thisRUNS.append(r)
+            thisPARAMSLIST.append(PARAMSLIST[num])
+
+    for o in ORDERS:
+        ttt = preparePulls(thisRUNS, thisPARAMSLIST, IT, o)
+        if ALL.has_key(o):
+            # from IPython import embed
+            # embed()
+            # sys.exit(1)
+            for k, v in ALL[o].iteritems():
+                ALL[o][k] = numpy.append(v, ttt[k], axis=0)
+        else:
+            ALL[o] = ttt
+
+# Got through observables
+BEST={}
+HNAMES=sorted(ALL[ALL.keys()[0]].keys())
+for hn in HNAMES:
+    if ALL[ORDERS[0]][hn].ndim == 1:
+        nbins = 1
+    else:
+        nbins=ALL[ORDERS[0]][hn].shape[1]
+    nentries=ALL[ORDERS[0]][hn].shape[0]
+    temp_best=[]
+    # Iterate over bins
+    for i in xrange(nbins):
+        temp_pull = []
+        for o in ORDERS:
+            if nbins>1:
+                temp_pull.append(sum([x*x for x in ALL[o][hn][:,i]])/nentries)
+            else:
+                temp_pull.append(sum([x*x for x in ALL[o][hn]])/nentries)
+        gof = [numpy.sqrt(temp_pull[x]) for x in xrange(len(ORDERS))]
+        best = min(gof)
+        bestorderforbin = ORDERS[gof.index(best)]
+        temp_best.append(bestorderforbin)
+        import pylab
+        pylab.clf()
+        if any([x<=0 for x in gof]):
+            pylab.plot(ORDERS, gof)
+        else:
+            pylab.semilogy(ORDERS, gof)
+        pylab.title("pull %s bin#%i"%(hn ,i))
+        pylab.savefig("pull_%s_%i_%i.pdf"%(hn.replace("/","_"),opts.NITERATIONS, i))
+        pylab.clf()
+        pylab.plot(ORDERS[0:-1], [gof[j+1]/gof[j] for j in xrange(len(gof)-1)])
+        print ([gof[j+1]/gof[j] for j in xrange(len(gof)-1)])
+        pylab.title("pull ratio %s bin#%i"%(hn ,i))
+        pylab.savefig("ratio_%s_%i_%i.pdf"%(hn.replace("/","_"),opts.NITERATIONS, i))
+    BEST[hn] = temp_best
+
+print (BEST)
+from IPython import embed
+embed()
+sys.exit(1)
+

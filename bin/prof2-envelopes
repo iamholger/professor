@@ -1,0 +1,185 @@
+#! /usr/bin/env python
+
+"""\
+    %prog <runsdir> [datafile directory] [opts]
+
+Envelope of input data
+"""
+
+import matplotlib, os
+matplotlib.use(os.environ.get("MPL_BACKEND", "Agg"))
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("--pname", "--pfile", dest="PNAME", default="params.dat", help="Name of the params file to be found in each run directory (default: %default)")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict plotting to a subset of histograms (default: %default)")
+op.add_option("-o", "--outdir", dest="OUTDIR", default="envelopes", help="Output folder for plots (default: %default)")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="Turn off messages")
+opts, args = op.parse_args()
+
+
+# TODO: add ipol envelope!
+
+## Get mandatory arguments
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+RUNSDIR = args[0]
+
+if len(args)==2:
+    REFDIR = args[1]
+else:
+    print "No data directory given"
+    REFDIR = None
+
+## Load the Professor machinery
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+
+## Load MC run histos and params
+import glob
+INDIRS = glob.glob(os.path.join(RUNSDIR, "*"))
+try:
+    PARAMS, HISTOS = prof.read_rundata(INDIRS, opts.PNAME)
+    print
+except Exception, e:
+    print e
+    sys.exit(1)
+
+## Weight file parsing to select a histos subset
+if opts.WFILE:
+    matchers = prof.read_pointmatchers(opts.WFILE)
+    for hn in HISTOS.keys():
+        if not any(m.match_path(hn) for m in matchers.keys()):
+            del HISTOS[hn]
+        elif opts.DEBUG:
+            print "Observable %s passed weight file path filter" % hn
+    print "Filtered observables by path, %d remaining" % len(HISTOS)
+HNAMES = HISTOS.keys()
+
+## If there's nothing left to interpolate, exit!
+if not HNAMES:
+    print "No observables remaining... exiting"
+    sys.exit(1)
+
+def mk_envelope(histos):
+    """ Take DataHistos and return coordinates for plotting """
+    # Iterate over bins, get envelope representation
+    # For each bin, return [xmin, xmax, mean(y), min(y), max(y)]
+    E=[]
+    for num, b in enumerate(histos[histos.keys()[0]].bins):
+        t_b = [x.bins[num].val for x in histos.values()]
+        E.append([b.xmin, b.xmax, sum(t_b)/len(t_b), min(t_b), max(t_b)])
+    return E
+
+def mk_data(histo):
+    """ Take a DataHisto and return coordinates for plotting """
+    d= []
+    for num, b in enumerate(histo.bins):
+        d.append([b.xmid, min(b.xmax-b.xmid, b.xmid- b.xmin),  b.val, b.err])
+    return d
+
+def plot_envelope(env, data=None, name="envelope"):
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+    # This is the Main figure object
+    fig = plt.figure(figsize=(8,6), dpi=100)
+
+    # This sets up the grid for main and ratio plot
+    gs = mpl.gridspec.GridSpec(1, 1)#, height_ratios=[3,1], hspace=0)
+
+    # Create a main plot
+    axmain = fig.add_subplot(gs[0])
+    axmain.set_ylabel("$f(x)$")
+    axmain.set_xlabel("$x=$ %s"%name)
+
+    # Convenience stuff for plotting clarity
+    X, UPPER, LOWER, MEAN = [], [], [], []
+    for num, b in enumerate(env):
+        ymean = b[-3]
+        ymin  = b[-2]
+        ymax  = b[-1]
+        xmin  = b[0]
+        xmax  = b[1]
+        X.append(xmin)
+        X.append(xmax)
+        UPPER.append(ymax)
+        UPPER.append(ymax)
+        LOWER.append(ymin)
+        LOWER.append(ymin)
+        MEAN.append( ymean )
+        MEAN.append( ymean )
+
+    # Envelope
+    axmain.fill_between(X, LOWER, UPPER, edgecolor="none", facecolor='yellow', interpolate=False)
+    # Mean of envelope
+    axmain.plot(X, MEAN, "b-", label="Mean")
+
+    # Data plot
+    if data is not None:
+        Xdata = [x[0] for x in data]
+        dX    = [x[1] for x in data]
+        Ydata = [x[2] for x in data]
+        dY    = [x[3] for x in data]
+        axmain.errorbar(Xdata, Ydata, dY, dX, fmt="k.", linewidth=1.3, label="Data")
+
+
+    # Switch off the frame in the legend
+    leg = axmain.legend(loc=0, numpoints=1)
+    fr = leg.get_frame()
+    fr.set_visible(False)
+
+    # Remove all unnecessary white space
+    plt.tight_layout()
+
+    # Output dir, path
+    import os
+    if not os.path.exists(opts.OUTDIR):
+        os.makedirs(opts.OUTDIR)
+    outname = os.path.join(opts.OUTDIR, "%s.pdf"%name)
+
+    # Save image as PDF
+    plt.savefig(outname)
+    plt.close(fig)
+
+
+## Read reference data histos
+import os, sys, glob
+DHISTOS = {}
+if REFDIR is not None:
+    REFFILES = glob.glob(os.path.join(REFDIR, "*"))
+    for rf in REFFILES:
+        DHISTOS.update(prof.read_histos(rf))
+    DNAMES={}
+    # filtering
+    for h in HNAMES:
+        for d in DHISTOS.keys():
+            if h in d:
+                DNAMES[h]=d
+    # Free memory
+    for d in DHISTOS.keys():
+        if not d in DNAMES.values():
+            del DHISTOS[d]
+
+# Plotting
+for hname in HISTOS.keys():
+    h=HISTOS[hname]
+    e=mk_envelope(h)
+    # Sanitisation for label and output file name
+    name=hname.lstrip("/").replace("/","_")
+
+    # Plot data too
+    if REFDIR is not None and hname in DNAMES.keys():
+        data = mk_data(DHISTOS[DNAMES[hname]])
+        plot_envelope(e, data, name)
+    else:
+        plot_envelope(e, name=name)
+
+
+if not opts.QUIET:
+    print "Plots written to %s"%opts.OUTDIR
+
+sys.exit(0)

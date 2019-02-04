@@ -1,0 +1,237 @@
+#! /usr/bin/env python
+
+"""\
+%prog <runsdir> [<ipolfile>=ipol.dat] [opts]
+
+Interpolate histo bin values as a function of the parameter space by loading
+run data and parameter lists from run directories in $runsdir (often "mc")
+
+TODO:
+ * Use weight file position matches to exclude some bins, as well as path matching
+ * Handle run combination file/string (write a hash of the run list into the ipol filename?)
+ * Support asymm error parameterisation
+"""
+
+from __future__ import division
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("--pname", "--pfile", dest="PNAME", default="params.dat", help="Name of the params file to be found in each run directory (default: %default)")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict ipol building to a subset of bins (default: %default)")
+op.add_option("--order", dest="ORDER", default=3, help="Global order of polynomials for interpolation. auto also possible")
+op.add_option("--ierr",  dest="ERR_MODE", default="symm", help="Whether to interpolate MC errors: none, mean, median, symm (default: %default)") #< add rel, asymm
+op.add_option("--eorder", dest="ERR_ORDER", default=None, type=int, help="Global order of polynomials for uncertainty interpolation (default: same as from --order)")
+op.add_option("--rc", dest="RUNCOMBS", default=None, help="Ru combination file")
+# TODO: Add a no-scale option
+# TODO: Change to instead (optionally) specify the max number of parallel threads/procs. Use by default if ncores > 1?
+op.add_option("-j", dest="MULTI", type=int, default=1, help="Number of threads to use")
+op.add_option("--summ",  dest="SUMMARY", default="", help="Summary description to be written to the ipol output file")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="Turn off messages")
+op.add_option("--split", dest="SPLIT", default=None, help="Can incorporate a linear split in parameter space. Provide \"ParamName1 ParamName2 Value1 Value2 Gradient (these describe the line down which to split the plot. Value1 and Value2 form the coords of a point on the line.) ABOVE/BELOW (ABOVE => use runs above the line etc)\"")
+op.add_option("--subspace", dest="SUBSPACE", default=None, help="Simple x<y filtering. Provide \"ParamName ABOVE/BELOW Value\"")
+op.add_option("--logy", dest="LOGY", action="store_true", default=False, help="Parametrise the logy of read in values. (Experimental)")
+op.add_option("--auto-omin",  dest="AUTO_OMIN", type=int, default=0,  help="Minimum allowed order with --order auto")
+op.add_option("--auto-omax",  dest="AUTO_OMAX", type=int, default=4,  help="Maximum allowed order with --order auto")
+op.add_option("--auto-nit",   dest="AUTO_NIT",  type=int, default=10, help="Number of iteration with --order auto")
+op.add_option("--auto-split",   dest="AUTO_SPLIT",  type=float, default=0.2, help="Fraction of test sample with --order auto")
+op.add_option("--medianfilt",   dest="MEDIAN_FILT",  type=float, default=-1, help="Bin-wise filtering of inputs by median relative error. (Experimental)")
+opts, args = op.parse_args()
+
+## Get mandatory arguments
+if len(args) < 1:
+    print("Argument missing... exiting\n\n")
+    op.print_usage()
+    sys.exit(1)
+RUNSDIR = args[0]
+IFILE = "ipol.dat"
+if len(args) >= 2:
+    IFILE = args[1]
+
+if not os.path.exists(RUNSDIR):
+    print("Error, specified run dir '%s' does not exist"%RUNSDIR)
+    sys.exit(1)
+
+## By default, use the same ipol order for errors as for values
+if opts.ERR_ORDER is None:
+    opts.ERR_ORDER = opts.ORDER
+
+## Load the Professor machinery
+import professor2 as prof
+if not opts.QUIET:
+    print(prof.logo)
+
+# Read details of split in parameter space if necessary
+if opts.SPLIT != None:
+    Split = map(str, opts.SPLIT.split(' '))
+    splitParam1 = Split[0]
+    splitParam2 = Split[1]
+    splitVal1 = float(Split[2])
+    splitVal2 = float(Split[3])
+    splitGrad = float(Split[4])
+
+## Load MC run histos and params
+try:
+    if RUNSDIR.endswith(".yaml"):
+        try:
+            import yaml
+        except ImportError, e:
+            print("Unable to import YAML:", e)
+            import sys
+            sys.exit(1)
+        PARAMS, HISTOS = prof.read_all_rundata_yaml(RUNSDIR)
+    elif RUNSDIR.endswith(".h5") or RUNSDIR.endswith(".hdf5"):
+        try:
+            import h5py
+        except ImportError, e:
+            print("Unable to import H5PY:", e)
+            import sys
+            sys.exit(1)
+        PARAMS, HISTOS = prof.read_all_rundata_h5(RUNSDIR)
+    else:
+        PARAMS, HISTOS = prof.read_all_rundata(RUNSDIR, opts.PNAME)
+    RUNS, PARAMNAMES, PARAMSLIST = prof.mk_ipolinputs(PARAMS)
+except Exception, e:
+    print(e)
+    sys.exit(1)
+
+# --rc runcombs.dat:4
+# would use the 4th line of the runcombs.dat file
+if opts.RUNCOMBS is not None:
+    f_rc, line = opts.RUNCOMBS.split(":")
+    with open(f_rc) as f:
+        temp=[l for l in f]
+    thisRC = temp[int(line)].split()
+
+    # Filtering and overwriting
+    thisRUNS, thisPARAMSLIST = [], []
+    for num, r in enumerate(RUNS):
+        if r in thisRC:
+            thisRUNS.append(r)
+            thisPARAMSLIST.append(PARAMSLIST[num])
+    RUNS=thisRUNS
+    PARAMSLIST=thisPARAMSLIST
+
+
+## Some useful announcements about the data loaded and the interpolation planned
+if not opts.QUIET and not opts.ORDER=="auto":
+    thisO = int(opts.ORDER)
+    minnruns =prof.calcnumCoeffs(len(PARAMNAMES), thisO)
+    if (len(RUNS) < minnruns):
+        print "Not enough runs for order %i polynomials --- would require %i"%(thisO, minnruns)
+        for i in xrange(1, thisO):
+            if (prof.calcnumCoeffs(len(PARAMNAMES), thisO -i) <= len(RUNS)):
+                print "Try order %i (min %i runs)"%(thisO -i, prof.calcnumCoeffs(len(PARAMNAMES), thisO -i))
+        import sys
+        sys.exit(1)
+    else:
+        print "Building %dD interpolations in %d params: require at least %d runs" % \
+            (thisO, len(PARAMNAMES), prof.calcnumCoeffs(len(PARAMNAMES), thisO))
+        print "Loaded %d distinct observables from %d runs" % (len(HISTOS), len(RUNS))
+
+
+## Weight file parsing to select a histos subset
+if opts.WFILE:
+    matchers = prof.read_pointmatchers(opts.WFILE)
+    for hn in HISTOS.keys():
+        if not any(m.match_path(hn) for m in matchers.keys()):
+            del HISTOS[hn]
+        elif opts.DEBUG:
+            print "Observable %s passed weight file path filter" % hn
+    print "Filtered observables by path, %d remaining" % len(HISTOS)
+HNAMES = HISTOS.keys()
+
+
+
+
+
+## If there's nothing left to interpolate, exit!
+if not HNAMES:
+    print "No observables remaining... exiting"
+    sys.exit(1)
+
+
+## Robustness tests and cleaning: only retain runs that contain every histo
+# TODO: combine with weights histo vetoing -- should we explicitly unload unused run data, or keep it for the next combination to use? Or do we now leave runcombs to the user?
+bad, badnum = [], []
+for irun, run in enumerate(RUNS):
+    for hn in HNAMES:
+        if not HISTOS[hn].has_key(run):
+            bad.append(run)
+            badnum.append(irun)
+            break
+if opts.LIMITS != None:
+    limits, fixed = prof.read_limitsandfixed(opts.LIMITS)
+    for irun, run in enumerate(RUNS):
+        for inam, nam in enumerate(PARAMNAMES):
+            if PARAMSLIST[irun][inam] <= limits[nam][0] or PARAMSLIST[irun][inam] >= limits[nam][1]:
+                bad.append(run)
+                badnum.append(irun)
+                break
+
+if opts.SPLIT != None:
+    ip1 = PARAMNAMES.index(splitParam1)
+    ip2 = PARAMNAMES.index(splitParam2)
+    for irun, run in enumerate(RUNS):
+        ycheck = PARAMSLIST[irun][ip2]-splitGrad*(PARAMSLIST[irun][ip1]-splitVal1)
+	if Split[5] == "ABOVE": #if taking values above the split, remove those below
+            if ycheck <= splitVal2:
+                bad.append(run)
+                badnum.append(irun)
+	elif Split[5] == "BELOW": #if taking values below the split, remove those above
+            if ycheck >= splitVal2:
+                bad.append(run)
+                badnum.append(irun)
+	else:
+            print "Error: must specify either ABOVE or BELOW the split"
+            sys.exit(1)
+
+if opts.SUBSPACE is not None: #NOTE for future, do this with text files
+    pname, operation, value = opts.SUBSPACE.split()
+    ip = PARAMNAMES.index(pname)
+    value=float(value)
+    for irun, run in enumerate(RUNS):
+        ycheck = PARAMSLIST[irun][ip]
+	if operation == "ABOVE": #if taking values above the split, remove those below
+            if ycheck <= value:
+                bad.append(run)
+                badnum.append(irun)
+	elif operation == "BELOW": #if taking values below the split, remove those above
+            if ycheck >= value:
+                bad.append(run)
+                badnum.append(irun)
+	else:
+            print "Error: must specify either ABOVE or BELOW the split"
+            sys.exit(1)
+
+
+if bad:
+    print "Found %d bad runs in %d total... removing" % (len(bad), len(RUNS))
+    goodr, goodp = [], []
+    for irun, run in enumerate(RUNS):
+        if not irun in badnum:
+            goodr.append(run)
+            goodp.append(PARAMSLIST[irun])
+    RUNS = goodr
+    PARAMSLIST = goodp
+
+## If there's nothing left to interpolate, exit!
+if not RUNS:
+    print "No valid runs remaining... exiting"
+    sys.exit(1)
+
+CONFIG = {"MULTI":opts.MULTI, "ORDER":opts.ORDER, "ERR_MODE":opts.ERR_MODE, "ERR_ORDER":opts.ERR_ORDER, "QUIET":opts.QUIET, "DEBUG":opts.DEBUG}
+CONFIG["AUTO_OMIN"] = opts.AUTO_OMIN
+CONFIG["AUTO_OMAX"] = opts.AUTO_OMAX
+CONFIG["AUTO_NIT"] = opts.AUTO_NIT
+CONFIG["AUTO_SPLIT"] = opts.AUTO_SPLIT
+CONFIG["MEDIAN_FILT"] = opts.MEDIAN_FILT
+CONFIG["LOGY"]=opts.LOGY
+IPOLDICT = prof.mkStandardIpols(HISTOS, HNAMES, RUNS, PARAMSLIST, CONFIG)
+
+
+## Active memory clean-up
+del HISTOS
+
+## Write out meta info
+prof.writeIpol(IFILE, IPOLDICT, [PARAMNAMES, PARAMSLIST], RUNS, opts.SUMMARY, RUNSDIR)
