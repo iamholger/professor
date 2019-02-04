@@ -1,0 +1,177 @@
+#! /usr/bin/env python
+
+"""\
+%prog -d <datadir>  [ipolfile(s)] [opts]
+
+Read in a minimisation result, datadir and ipolfile(s) to
+construct eigentunes.
+
+This at the moment only does loglikelihood sampling
+in -0.5*profChi2 and plots the projections.
+
+This is experimental work.
+"""
+
+
+import optparse, os, sys
+op = optparse.OptionParser(usage=__doc__)
+op.add_option("-d", "--datadir", dest="DATADIR", default=None, help="The data directory")
+op.add_option("-m", "--minres", dest="RESULT",  default=None, help="Minimisation result to use for eigentunes calculation")
+op.add_option("-o", "--outdir", dest="OUTDIR", default="emcee", help="Output directory")
+op.add_option("--mc-np", dest="NPOINTS", type=int, default=1000, help="Number of emcee points to generate (default: %default)")
+op.add_option("--mc-nw", dest="NWALKER", type=int, default=100, help="Number of emcee walker (default: %default)")
+op.add_option("-r", "--runsdir", dest="RUNSDIR", default=None, help="The runs directory")
+op.add_option("-v", "--debug", dest="DEBUG", action="store_true", default=False, help="Turn on some debug messages")
+op.add_option("-q", "--quiet", dest="QUIET", action="store_true", default=False, help="turn off messages")
+op.add_option("--wfile", dest="WFILE", default=None, help="Path to a weight file, used to restrict ipol building to a subset of bins (default: %default)")
+op.add_option("--limits", dest="LIMITS", default=None, help="Simple text file with parameter limits and fixed parameters")
+op.add_option("--filter", dest="FILTER", action="store_true", default=False, help="Filter out data bins that have 0 error")
+op.add_option("--limit-errs", dest="USE_RUNSDIR", action="store_true", default=False, help="Re-read the runsdir to regularise error ipols")
+opts, args = op.parse_args()
+
+## Get mandatory arguments, same as prof2-tune
+if len(args) < 1:
+    print "Argument missing... exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+REFDIR = opts.DATADIR
+if REFDIR is None:
+    print "Error, no data directory specified (-d/--datadir), exiting\n\n"
+    op.print_usage()
+    sys.exit(1)
+IFILES = args
+RUNSDIR = opts.RUNSDIR
+
+# Sanity
+if not os.path.exists(REFDIR):
+    print "Error, specified data directory '%s' does not exist, exiting\n\n"%REFDIR
+    op.print_usage()
+    sys.exit(1)
+
+
+## Load Professor and show the standard banner
+import professor2 as prof
+if not opts.QUIET:
+    print prof.logo
+
+# Read data files
+DHISTOS = prof.read_all_histos(REFDIR)
+
+from collections import OrderedDict
+MASTERBOX=OrderedDict()
+MASTERCENTER=OrderedDict()
+
+## Weight file parsing --- by default read from results file
+if opts.WFILE is None and opts.RESULT is None:
+    matchers=None
+else:
+    matchers = prof.read_pointmatchers(opts.WFILE) if opts.WFILE else prof.read_pointmatchersfromresults(opts.RESULT)
+
+## Try to read run histos and extract maximum errors --- NOTE this bit might be broken with patches NOTE
+MAXERRDICT = None
+if opts.USE_RUNSDIR:
+    try:
+        _, RUNHISTOS = prof.read_all_rundata(RUNSDIR, None) #< don't care about reading params files
+        MAXERRDICT = prof.find_maxerrs(RUNHISTOS)
+    except:
+        print "Could not read run data for error regularisation -- chi2 may be unstable"
+
+for IFILE in IFILES:
+    box, center, fitdata = prof.prepareBox(IFILE, DHISTOS, matchers, MAXERRDICT, opts.FILTER, opts.DEBUG)
+    MASTERBOX[box]=dict(fitdata)
+    MASTERCENTER[center]=MASTERBOX[box]
+
+## Take parameter names from the first box and assert that all other boxes (if present) have the same names
+PNAMES=MASTERBOX.values()[0]["PNAMES"]
+for v in MASTERBOX.values()[1:]:
+    assert PNAMES == v["PNAMES"]
+
+# Set appropriate emcee sampling limits
+if opts.LIMITS is not None:
+    import professor2 as prof
+    limits, fixed = prof.read_limitsandfixed(opts.LIMITS)
+    limits=[limits[x] for x in PNAMES]
+elif opts.RESULT is not None:
+    P_min, OTH = prof.readResult(opts.RESULT)
+    # Parameter limits
+    limits=prof.getParamLimits(OTH).values()
+    limits=[limits[num] for num, __ in enumerate(PNAMES)]
+
+else:
+    pmins  = [min([box[num][0] for box in MASTERBOX.keys()]) for num, __ in enumerate(PNAMES)]
+    pmaxs  = [max([box[num][1] for box in MASTERBOX.keys()]) for num, __ in enumerate(PNAMES)]
+    limits = zip(pmins,pmaxs) # This is required for the boundaries of emcee sampling
+
+
+funcdef = prof.mk_fitfunc("prof.simpleGoF", PNAMES, "profGoF", ["MASTERBOX", "MASTERCENTER", "opts.DEBUG"])
+exec funcdef in locals()
+
+if not opts.QUIET:
+
+    print "\n"
+    print 60*"*"
+    print "* Using emcee, please cite https://arxiv.org/abs/1202.3665 *"
+    print 60*"*"
+    print "\n"
+try:
+    import emcee
+except ImportError:
+    raise Exception("Cannot use emcee, try pip install emcee")
+
+import numpy as np
+def loglike(PP):
+    if not prof.pInBOX(PP, limits):
+        return -np.inf
+    likelihood = -0.5*profGoF(*PP)
+    return likelihood
+
+
+# A bit of a hack to compactly have the script work with and without mpi
+usempi=False
+try:
+    from emcee.utils import MPIPool
+    pool = MPIPool()
+    usempi=True
+except:
+    pool = None
+
+rank = 0
+try:
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    size = comm.Get_size()
+    rank = comm.Get_rank()
+except:
+    pass
+
+if rank==0:
+    import time
+    start_time = time.time()
+    if not os.path.exists(opts.OUTDIR):
+        os.makedirs(opts.OUTDIR)
+
+
+# This is all pretty much stolen from the emcee documentation
+ndim, nwalkers = len(PNAMES), opts.NWALKER
+p0 = [np.array([np.random.uniform(p[0],p[1]) for p in limits]) for i in range(nwalkers)]
+sampler = emcee.EnsembleSampler(nwalkers, ndim, loglike, args=[], pool=pool)
+pos, prob, state =  sampler.run_mcmc(p0, opts.NPOINTS)
+
+if usempi:
+    pool.close()
+
+if rank==0:
+    print("Sampling finished after %s seconds" % (time.time() - start_time))
+
+    import matplotlib.pyplot as pl
+    for i in range(ndim):
+        pl.clf()
+        pl.figure()
+        pl.hist(sampler.flatchain[:,i], 100, color="k", histtype="step")
+        pl.title(PNAMES[i])
+        pl.savefig(os.path.join(opts.OUTDIR, "emcee_%i_%s.pdf"%(i, PNAMES[i])))
+
+    if not opts.QUIET:
+        print "Mean acceptance fraction: {0:.3f}".format(np.mean(sampler.acceptance_fraction))
+
+    print "Output written to", opts.OUTDIR

@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+
+
+def download(anapath, outname=None, mode="yodastat"):
+    assert mode in ["yoda", "yodastat"]
+    # Some string mangling to ket inspire/spires key
+    full = anapath.rstrip("/").split("/")[-1] # Remove leading and trailing slashes
+    base = full.split("_")[-1] # Get string with ID
+    spires = False
+    if "S" in base:
+        key = base.lstrip("S")
+        spires=True
+    elif "I" in base:
+        key = base.lstrip("I")
+    else:
+        print "Unknown analysis key: %s"%base
+
+    if spires:
+        url = "http://hepdata.cedar.ac.uk/view/irn%s/%s"%(key, mode)
+    else:
+        url = "http://hepdata.cedar.ac.uk/view/ins%s/%s"%(key, mode)
+
+    # Stolen from rivet-mkanalysis
+    import urllib
+    print "Getting data file from HepData at %s"%url
+    httpstream = urllib.urlopen(url)
+    yodastr = httpstream.read()
+    if not yodastr or "<html>" in yodastr:
+        print "Problem encountered when getting data from HepData (%s). No reference data file written."%url
+    else:
+        if outname is None:
+            outname ="%s.yoda"%full
+        with open(outname, "w") as f:
+            f.write(yodastr)
+        print "File %s written"%outname
+    httpstream.close()
+
+import sys
+if not len(sys.argv[1:]) == 3:
+    print "Usage:  prof-data  OPAL_1998_S3749908  output.yoda  yoda"
+    print "Or:     prof-data  OPAL_1998_S3749908  output.yoda  yodastat"
+    sys.exit(0)
+download(sys.argv[1], sys.argv[2], sys.argv[3])
